@@ -1,0 +1,130 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ServiceType {
+  PM2
+  STATIC_FRONTEND
+}
+
+enum DeploymentStatus {
+  DEPLOYING
+  SUCCESS
+  FAILED
+  ERROR
+}
+
+model Client {
+  id        String    @id @default(cuid())
+  name      String
+  email     String    @unique
+  googleSubject String? @unique
+  passwordHash String
+  forcePasswordChange Boolean @default(true)
+  enabled   Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  services  Service[]
+}
+
+model ServerAgent {
+  id              String    @id @default(cuid())
+  name            String
+  baseUrl         String
+  enrollmentToken String    @unique
+  apiKeyHash      String?
+  apiKeyEncrypted String?
+  enabled         Boolean   @default(true)
+  lastSeenAt      DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  services        Service[]
+  deployments     Deployment[]
+
+  @@index([enabled])
+}
+
+model Service {
+  id                String      @id @default(cuid())
+  name              String
+  slug              String
+  type              ServiceType
+  repositoryUrl     String
+  branch            String      @default("main")
+  projectKey        String      @unique
+  workingDirectory  String
+  deployDirectory   String?
+  pm2ProcessName    String?
+  templateKey       String?
+  customCommands    Json?
+  webhookSecretHash String?
+  enabled           Boolean     @default(true)
+  clientId          String
+  agentId           String
+  client            Client      @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  agent             ServerAgent @relation(fields: [agentId], references: [id])
+  deployments       Deployment[]
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  @@unique([clientId, slug])
+  @@index([clientId])
+  @@index([agentId])
+}
+
+model Deployment {
+  id             String           @id @default(cuid())
+  runId          String           @unique
+  serviceId      String
+  agentId        String
+  status         DeploymentStatus @default(DEPLOYING)
+  triggerSource  String
+  deployerEmail  String?
+  commitHash     String?
+  branch         String?
+  commitMessage  String?
+  startedAt      DateTime         @default(now())
+  completedAt    DateTime?
+  durationMs     Int?
+  failureReason  String?
+  service        Service          @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  agent          ServerAgent      @relation(fields: [agentId], references: [id])
+  logs           DeploymentLog[]
+
+  @@index([serviceId, startedAt])
+  @@index([startedAt])
+}
+
+model DeploymentLog {
+  id           String     @id @default(cuid())
+  deploymentId String
+  timestamp    DateTime   @default(now())
+  message      String
+  deployment   Deployment @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+
+  @@index([deploymentId, timestamp])
+}
+
+model AuditLog {
+  id           String   @id @default(cuid())
+  actorEmail   String
+  action       String
+  resourceType String
+  resourceId   String?
+  metadata     Json?
+  createdAt    DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+model SystemSetting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String
+  updatedAt DateTime @updatedAt
+}
