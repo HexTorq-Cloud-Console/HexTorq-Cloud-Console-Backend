@@ -14,6 +14,12 @@ const app = express();
 const prisma = new PrismaClient();
 const googleClient = process.env.GOOGLE_CLIENT_ID ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID) : null;
 const port = Number(process.env.PORT || 4000);
+const defaultFrontendOrigin = 'https://hex-torq-cloud-console-frontend.vercel.app';
+const allowedFrontendOrigins = new Set(
+  [process.env.FRONTEND_URL, defaultFrontendOrigin, 'http://localhost:3000']
+    .filter(Boolean)
+    .map((origin) => origin.replace(/\/$/, ''))
+);
 
 if (!process.env.JWT_SECRET) throw new Error('JWT_SECRET is required');
 if (!process.env.SUPER_ADMIN_EMAIL || !process.env.SUPER_ADMIN_PASSWORD) {
@@ -22,7 +28,15 @@ if (!process.env.SUPER_ADMIN_EMAIL || !process.env.SUPER_ADMIN_PASSWORD) {
 const superAdminPasswordHash = await bcrypt.hash(process.env.SUPER_ADMIN_PASSWORD, 12);
 
 app.use(helmet());
-app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:3000' }));
+app.use(cors({
+  origin(origin, callback) {
+    const normalizedOrigin = origin?.replace(/\/$/, '');
+    if (!origin || allowedFrontendOrigins.has(normalizedOrigin)) return callback(null, true);
+    return callback(new Error('Origin is not allowed by HexTorq Cloud Console CORS policy'));
+  },
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Agent-Id', 'X-Agent-Key'],
+}));
 app.use(express.json({ limit: '1mb' }));
 
 const loginSchema = z.object({
