@@ -416,12 +416,28 @@ async function requestServiceDeployment(service, { requestedBy, runId, source = 
     });
     const body = await response.text();
     const parsed = parseJsonBody(body);
+    const deploymentRunId = typeof parsed?.runId === 'string' && parsed.runId ? parsed.runId : runId;
+    if (response.ok) {
+      await prisma.deployment.upsert({
+        where: { runId: deploymentRunId },
+        create: {
+          runId: deploymentRunId,
+          serviceId: service.id,
+          agentId: service.agent.id,
+          status: 'DEPLOYING',
+          triggerSource: source,
+          deployerEmail: requestedBy,
+          branch: service.branch,
+        },
+        update: {},
+      });
+    }
     return {
       ok: response.ok,
       httpStatus: response.status,
       body,
       parsed,
-      deploymentRunId: typeof parsed?.runId === 'string' && parsed.runId ? parsed.runId : runId,
+      deploymentRunId,
     };
   } catch (error) {
     const body = JSON.stringify({ message: 'Pipeline agent is unreachable', error: error.message });
@@ -1337,7 +1353,7 @@ app.post('/api/agents/:agentId/events', requireAgentKey, async (req, res, next) 
     const service = await prisma.service.findFirst({ where: { projectKey: input.projectKey, agentId: agent.id } });
     if (!service) return res.status(404).json({ message: 'Service is not registered to this agent' });
     if (input.type === 'deployment-started') {
-      await prisma.deployment.upsert({ where: { runId: input.runId }, create: { runId: input.runId, serviceId: service.id, agentId: agent.id, triggerSource: input.triggerSource || 'webhook', deployerEmail: input.deployerEmail, status: 'DEPLOYING', commitHash: input.commitHash, branch: input.branch, commitMessage: input.commitMessage }, update: {} });
+      await prisma.deployment.upsert({ where: { runId: input.runId }, create: { runId: input.runId, serviceId: service.id, agentId: agent.id, triggerSource: input.triggerSource || 'webhook', deployerEmail: input.deployerEmail, status: 'DEPLOYING', commitHash: input.commitHash, branch: input.branch, commitMessage: input.commitMessage }, update: { status: 'DEPLOYING', deployerEmail: input.deployerEmail, branch: input.branch, commitHash: input.commitHash, commitMessage: input.commitMessage } });
     } else {
       const deployment = await prisma.deployment.findUnique({ where: { runId: input.runId } });
       if (!deployment) return res.status(404).json({ message: 'Deployment run not found' });
