@@ -19,30 +19,62 @@ enum DeploymentStatus {
   ERROR
 }
 
+enum AccessType {
+  SFTP
+  DATABASE
+}
+
+enum WebhookRunSource {
+  MANUAL
+  SCHEDULED
+}
+
+enum WebhookRunStatus {
+  RUNNING
+  SUCCESS
+  PARTIAL
+  FAILED
+}
+
+enum WebhookCheckStatus {
+  QUEUED
+  RUNNING
+  SUCCESS
+  FAILED
+}
+
 model Client {
-  id        String    @id @default(cuid())
-  name      String
-  email     String    @unique
-  googleSubject String? @unique
-  passwordHash String
-  forcePasswordChange Boolean @default(true)
-  enabled   Boolean   @default(true)
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-  services  Service[]
+  id                          String             @id @default(cuid())
+  name                        String
+  email                       String             @unique
+  googleSubject               String?            @unique
+  passwordHash                String
+  forcePasswordChange         Boolean            @default(true)
+  enabled                     Boolean            @default(true)
+  webhookScheduleEnabled      Boolean            @default(false)
+  webhookScheduleIntervalDays Int?
+  webhookScheduleNextRunAt    DateTime?
+  webhookScheduleLastRunAt    DateTime?
+  createdAt                   DateTime           @default(now())
+  updatedAt                   DateTime           @updatedAt
+  services                    Service[]
+  accessEntries               ClientAccess[]
+  webhookHealthRuns           WebhookHealthRun[]
+
+  @@index([webhookScheduleEnabled, webhookScheduleNextRunAt])
 }
 
 model ServerAgent {
-  id              String    @id @default(cuid())
+  id              String       @id @default(cuid())
   name            String
   baseUrl         String
-  enrollmentToken String    @unique
+  enrollmentToken String       @unique
   apiKeyHash      String?
   apiKeyEncrypted String?
-  enabled         Boolean   @default(true)
+  enabled         Boolean      @default(true)
   lastSeenAt      DateTime?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
   services        Service[]
   deployments     Deployment[]
 
@@ -50,27 +82,28 @@ model ServerAgent {
 }
 
 model Service {
-  id                String      @id @default(cuid())
-  name              String
-  slug              String
-  type              ServiceType
-  repositoryUrl     String
-  branch            String      @default("main")
-  projectKey        String      @unique
-  workingDirectory  String
-  deployDirectory   String?
-  pm2ProcessName    String?
-  templateKey       String?
-  customCommands    Json?
-  webhookSecretHash String?
-  enabled           Boolean     @default(true)
-  clientId          String
-  agentId           String
-  client            Client      @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  agent             ServerAgent @relation(fields: [agentId], references: [id])
-  deployments       Deployment[]
-  createdAt         DateTime    @default(now())
-  updatedAt         DateTime    @updatedAt
+  id                  String               @id @default(cuid())
+  name                String
+  slug                String
+  type                ServiceType
+  repositoryUrl       String
+  branch              String               @default("main")
+  projectKey          String               @unique
+  workingDirectory    String
+  deployDirectory     String?
+  pm2ProcessName      String?
+  templateKey         String?
+  customCommands      Json?
+  webhookSecretHash   String?
+  enabled             Boolean              @default(true)
+  clientId            String
+  agentId             String
+  client              Client               @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  agent               ServerAgent          @relation(fields: [agentId], references: [id])
+  deployments         Deployment[]
+  webhookHealthChecks WebhookHealthCheck[]
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
 
   @@unique([clientId, slug])
   @@index([clientId])
@@ -78,23 +111,23 @@ model Service {
 }
 
 model Deployment {
-  id             String           @id @default(cuid())
-  runId          String           @unique
-  serviceId      String
-  agentId        String
-  status         DeploymentStatus @default(DEPLOYING)
-  triggerSource  String
-  deployerEmail  String?
-  commitHash     String?
-  branch         String?
-  commitMessage  String?
-  startedAt      DateTime         @default(now())
-  completedAt    DateTime?
-  durationMs     Int?
-  failureReason  String?
-  service        Service          @relation(fields: [serviceId], references: [id], onDelete: Cascade)
-  agent          ServerAgent      @relation(fields: [agentId], references: [id])
-  logs           DeploymentLog[]
+  id            String           @id @default(cuid())
+  runId         String           @unique
+  serviceId     String
+  agentId       String
+  status        DeploymentStatus @default(DEPLOYING)
+  triggerSource String
+  deployerEmail String?
+  commitHash    String?
+  branch        String?
+  commitMessage String?
+  startedAt     DateTime         @default(now())
+  completedAt   DateTime?
+  durationMs    Int?
+  failureReason String?
+  service       Service          @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  agent         ServerAgent      @relation(fields: [agentId], references: [id])
+  logs          DeploymentLog[]
 
   @@index([serviceId, startedAt])
   @@index([startedAt])
@@ -108,6 +141,65 @@ model DeploymentLog {
   deployment   Deployment @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
 
   @@index([deploymentId, timestamp])
+}
+
+model ClientAccess {
+  id                String     @id @default(cuid())
+  clientId          String
+  type              AccessType
+  label             String
+  host              String
+  port              Int
+  username          String
+  passwordEncrypted String
+  path              String?
+  databaseName      String?
+  sslMode           String?
+  notes             String?
+  enabled           Boolean    @default(true)
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+  client            Client     @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
+  @@index([clientId, type])
+}
+
+model WebhookHealthRun {
+  id                 String               @id @default(cuid())
+  clientId           String
+  source             WebhookRunSource
+  status             WebhookRunStatus     @default(RUNNING)
+  requestedBy        String?
+  totalServices      Int                  @default(0)
+  successfulServices Int                  @default(0)
+  failedServices     Int                  @default(0)
+  startedAt          DateTime             @default(now())
+  completedAt        DateTime?
+  client             Client               @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  checks             WebhookHealthCheck[]
+
+  @@index([clientId, startedAt])
+  @@index([status])
+}
+
+model WebhookHealthCheck {
+  id              String             @id @default(cuid())
+  runId           String
+  serviceId       String
+  deploymentRunId String?            @unique
+  status          WebhookCheckStatus @default(QUEUED)
+  httpStatus      Int?
+  message         String?
+  createdAt       DateTime           @default(now())
+  startedAt       DateTime?
+  completedAt     DateTime?
+  durationMs      Int?
+  run             WebhookHealthRun   @relation(fields: [runId], references: [id], onDelete: Cascade)
+  service         Service            @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@index([runId, createdAt])
+  @@index([serviceId, createdAt])
 }
 
 model AuditLog {

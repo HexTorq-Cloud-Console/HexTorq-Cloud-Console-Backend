@@ -9,11 +9,34 @@ import { z } from 'zod';
 import { PrismaClient } from '@prisma/client';
 import { OAuth2Client } from 'google-auth-library';
 import { serviceTemplates } from './templates.js';
+import {
+  nextScheduledRun,
+  nextScheduledRunAfter,
+  resolveScheduleOptions,
+} from './schedule.js';
 
 const app = express();
 const prisma = new PrismaClient();
 const googleClient = process.env.GOOGLE_CLIENT_ID ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID) : null;
 const port = Number(process.env.PORT || 4000);
+const webhookScheduleOptions = resolveScheduleOptions({
+  timeZone: process.env.WEBHOOK_SCHEDULE_TIMEZONE,
+  hour: process.env.WEBHOOK_SCHEDULE_HOUR,
+});
+function configuredMilliseconds(value, fallback, minimum) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.max(Math.floor(parsed), minimum);
+}
+
+const webhookHealthTimeoutMs = configuredMilliseconds(
+  process.env.WEBHOOK_HEALTH_DEPLOY_TIMEOUT_MS,
+  20 * 60 * 1000,
+  60 * 1000,
+);
+const webhookHealthPollMs = configuredMilliseconds(process.env.WEBHOOK_HEALTH_POLL_MS, 3000, 500);
+const schedulerEmail = process.env.WEBHOOK_SCHEDULER_EMAIL || 'scheduler@hextorq.local';
+const activeWebhookClients = new Set();
 const defaultFrontendOrigin = 'https://hex-torq-cloud-console-frontend.vercel.app';
 const allowedFrontendOrigins = new Set(
   [process.env.FRONTEND_URL, defaultFrontendOrigin, 'http://localhost:3000']
@@ -66,18 +89,26 @@ function encryptionKey() {
   return Buffer.from(key, 'hex');
 }
 
-function encryptAgentKey(value) {
+function encryptSecret(value) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', encryptionKey(), iv);
   const encrypted = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
   return `${iv.toString('hex')}.${cipher.getAuthTag().toString('hex')}.${encrypted.toString('hex')}`;
 }
 
-function decryptAgentKey(value) {
+function decryptSecret(value) {
   const [ivHex, tagHex, encryptedHex] = value.split('.');
   const decipher = crypto.createDecipheriv('aes-256-gcm', encryptionKey(), Buffer.from(ivHex, 'hex'));
   decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
   return Buffer.concat([decipher.update(Buffer.from(encryptedHex, 'hex')), decipher.final()]).toString('utf8');
+}
+
+function encryptAgentKey(value) {
+  return encryptSecret(value);
+}
+
+function decryptAgentKey(value) {
+  return decryptSecret(value);
 }
 
 function requireAuth(req, res, next) {
@@ -129,6 +160,10 @@ app.post('/api/auth/google', async (req, res) => {
     const ticket = await googleClient.verifyIdToken({ idToken: credential.data, audience: process.env.GOOGLE_CLIENT_ID });
     const payload = ticket.getPayload();
     if (!payload?.email || !payload.email_verified || !payload.sub) return res.status(401).json({ message: 'Google account could not be verified' });
+    if (payload.email.toLowerCase() === process.env.SUPER_ADMIN_EMAIL.toLowerCase()) {
+      await writeAudit(payload.email, 'AUTH_GOOGLE_LOGIN', 'SuperAdmin', null);
+      return res.json({ token: createToken(payload.email), user: { email: payload.email, role: 'SUPER_ADMIN' } });
+    }
     const client = await prisma.client.findUnique({ where: { email: payload.email.toLowerCase() } });
     if (!client || !client.enabled) return res.status(403).json({ message: 'This Google account is not registered as a client' });
     await prisma.client.update({ where: { id: client.id }, data: { googleSubject: payload.sub } });
@@ -137,8 +172,25 @@ app.post('/api/auth/google', async (req, res) => {
   } catch { res.status(401).json({ message: 'Invalid Google credential' }); }
 });
 
-app.get('/api/auth/me', requireAuth, (req, res) => {
-  res.json({ user: req.user });
+app.get('/api/auth/me', requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== 'CLIENT') return res.json({ user: req.user });
+    const client = await prisma.client.findUnique({
+      where: { id: req.user.clientId },
+      select: { id: true, email: true, enabled: true, forcePasswordChange: true },
+    });
+    if (!client || !client.enabled) return res.status(401).json({ message: 'Client account is disabled' });
+    return res.json({
+      user: {
+        email: client.email,
+        role: 'CLIENT',
+        clientId: client.id,
+        forcePasswordChange: client.forcePasswordChange,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post('/api/auth/change-password', requireAuth, async (req, res, next) => {
@@ -199,17 +251,750 @@ async function getAccessibleService(req, serviceId) {
   return service;
 }
 
+const accessTypeSchema = z.enum(['SFTP', 'DATABASE']);
+const optionalAccessText = z.string().trim().max(2000).optional().nullable();
+const accessCreateSchema = z.object({
+  clientId: z.string().min(1),
+  type: accessTypeSchema,
+  label: z.string().trim().min(1).max(120),
+  host: z.string().trim().min(1).max(255),
+  port: z.coerce.number().int().min(1).max(65535),
+  username: z.string().trim().min(1).max(255),
+  password: z.string().min(1).max(500),
+  path: optionalAccessText,
+  databaseName: optionalAccessText,
+  sslMode: optionalAccessText,
+  notes: optionalAccessText,
+  enabled: z.boolean().optional(),
+});
+const accessUpdateSchema = z.object({
+  type: accessTypeSchema.optional(),
+  label: z.string().trim().min(1).max(120).optional(),
+  host: z.string().trim().min(1).max(255).optional(),
+  port: z.coerce.number().int().min(1).max(65535).optional(),
+  username: z.string().trim().min(1).max(255).optional(),
+  password: z.string().min(1).max(500).optional(),
+  path: optionalAccessText,
+  databaseName: optionalAccessText,
+  sslMode: optionalAccessText,
+  notes: optionalAccessText,
+  enabled: z.boolean().optional(),
+}).refine((value) => Object.keys(value).length > 0, { message: 'No changes supplied' });
+
+function cleanAccessText(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  return text || null;
+}
+
+function validateAccessShape(type, path, databaseName) {
+  if (type === 'SFTP' && !path) return 'SFTP access requires a path';
+  if (type === 'DATABASE' && !databaseName) return 'Database access requires a maintenance database';
+  return null;
+}
+
+function accessRecordValues(input, current = null) {
+  const type = input.type ?? current?.type;
+  const path = type === 'SFTP'
+    ? cleanAccessText(input.path !== undefined ? input.path : current?.path)
+    : null;
+  const databaseName = type === 'DATABASE'
+    ? cleanAccessText(input.databaseName !== undefined ? input.databaseName : current?.databaseName)
+    : null;
+  const sslMode = type === 'DATABASE'
+    ? cleanAccessText(input.sslMode !== undefined ? input.sslMode : current?.sslMode) || 'Prefer'
+    : null;
+
+  return {
+    type,
+    label: input.label ?? current?.label,
+    host: input.host ?? current?.host,
+    port: input.port ?? current?.port,
+    username: input.username ?? current?.username,
+    path,
+    databaseName,
+    sslMode,
+    notes: input.notes !== undefined ? cleanAccessText(input.notes) : current?.notes ?? null,
+    enabled: input.enabled ?? current?.enabled ?? true,
+  };
+}
+
+function serializeClientAccess(entry) {
+  const { passwordEncrypted, ...access } = entry;
+  let password = null;
+  try {
+    password = decryptSecret(passwordEncrypted);
+  } catch (error) {
+    console.error('Unable to decrypt client access credentials:', error.message);
+  }
+  return { ...access, password };
+}
+
+function accessAuditMetadata(access) {
+  return {
+    clientId: access.clientId,
+    type: access.type,
+    label: access.label,
+    host: access.host,
+    port: access.port,
+    username: access.username,
+  };
+}
+
+app.get('/api/access', requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== 'CLIENT') return res.status(403).json({ message: 'Client access required' });
+    const entries = await prisma.clientAccess.findMany({
+      where: { clientId: req.user.clientId, enabled: true },
+      orderBy: [{ type: 'asc' }, { label: 'asc' }],
+    });
+    res.json({ access: entries.map(serializeClientAccess) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+function serviceDeploymentConfig(service) {
+  return {
+    id: service.id,
+    name: service.name,
+    slug: service.slug,
+    type: service.type,
+    repositoryUrl: service.repositoryUrl,
+    branch: service.branch,
+    projectKey: service.projectKey,
+    workingDirectory: service.workingDirectory,
+    deployDirectory: service.deployDirectory,
+    enabled: service.enabled,
+    pm2ProcessName: service.pm2ProcessName,
+    templateKey: service.templateKey,
+    customCommands: service.customCommands,
+  };
+}
+
+function parseJsonBody(body) {
+  try {
+    return JSON.parse(body);
+  } catch {
+    return null;
+  }
+}
+
+function upstreamMessage(parsed, body) {
+  const message = typeof parsed?.message === 'string' ? parsed.message : body;
+  return String(message || 'Pipeline request failed').slice(0, 2000);
+}
+
+async function requestServiceDeployment(service, { requestedBy, runId, source = 'console' } = {}) {
+  if (!service.agent?.apiKeyEncrypted) {
+    return {
+      ok: false,
+      httpStatus: 409,
+      body: 'Pipeline agent is not enrolled',
+      parsed: null,
+      deploymentRunId: runId,
+    };
+  }
+
+  try {
+    const response = await fetch(agentUrl(service.agent, `/webhook/${encodeURIComponent(service.projectKey)}`), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Console-Agent-Id': service.agent.id,
+        'X-Console-Agent-Key': decryptAgentKey(service.agent.apiKeyEncrypted),
+      },
+      body: JSON.stringify({
+        source,
+        requestedBy,
+        runId,
+        service: serviceDeploymentConfig(service),
+      }),
+      signal: AbortSignal.timeout(30 * 1000),
+    });
+    const body = await response.text();
+    const parsed = parseJsonBody(body);
+    return {
+      ok: response.ok,
+      httpStatus: response.status,
+      body,
+      parsed,
+      deploymentRunId: typeof parsed?.runId === 'string' && parsed.runId ? parsed.runId : runId,
+    };
+  } catch (error) {
+    const body = JSON.stringify({ message: 'Pipeline agent is unreachable', error: error.message });
+    return { ok: false, httpStatus: 502, body, parsed: parseJsonBody(body), deploymentRunId: runId };
+  }
+}
+
+function newDeploymentRunId() {
+  return `console-${crypto.randomUUID()}`;
+}
+
 app.post('/api/services/:serviceId/deploy', requireAuth, async (req, res, next) => {
   try {
     const service = await getAccessibleService(req, req.params.serviceId);
     if (!service) return res.status(404).json({ message: 'Service not found' });
-    if (!service.agent.apiKeyEncrypted) return res.status(409).json({ message: 'Pipeline agent is not enrolled' });
-    const agentHeaders = { 'Content-Type': 'application/json', 'X-Console-Agent-Id': service.agent.id, 'X-Console-Agent-Key': decryptAgentKey(service.agent.apiKeyEncrypted) };
-    const upstream = await fetch(agentUrl(service.agent, `/webhook/${encodeURIComponent(service.projectKey)}`), { method: 'POST', headers: agentHeaders, body: JSON.stringify({ source: 'console', requestedBy: req.user.email }) });
-    const body = await upstream.text();
-    if (!upstream.ok) return res.status(502).json({ message: 'Pipeline agent rejected deployment', upstreamStatus: upstream.status, upstreamBody: body });
-    await writeAudit(req.user.email, 'DEPLOYMENT_REQUESTED', 'Service', service.id, { triggerSource: 'console' });
-    res.status(202).json({ serviceId: service.id, message: 'Deployment requested', agentResponse: body });
+    const runId = newDeploymentRunId();
+    const result = await requestServiceDeployment(service, {
+      requestedBy: req.user.email,
+      runId,
+      source: 'console',
+    });
+    if (!result.ok) {
+      return res.status(result.httpStatus === 409 ? 409 : 502).json({
+        message: result.httpStatus === 409 ? 'Pipeline agent is not enrolled' : 'Pipeline agent rejected deployment',
+        upstreamStatus: result.httpStatus,
+        upstreamBody: result.body,
+      });
+    }
+    await writeAudit(req.user.email, 'DEPLOYMENT_REQUESTED', 'Service', service.id, {
+      triggerSource: 'console',
+      runId: result.deploymentRunId,
+    });
+    res.status(202).json({
+      serviceId: service.id,
+      runId: result.deploymentRunId,
+      message: 'Deployment requested',
+      agentResponse: result.body,
+    });
+  } catch (error) { next(error); }
+});
+
+const webhookHealthServiceSelect = {
+  id: true,
+  name: true,
+  slug: true,
+  type: true,
+  pm2ProcessName: true,
+  enabled: true,
+};
+const webhookScheduleClientSelect = {
+  id: true,
+  name: true,
+  email: true,
+  enabled: true,
+  webhookScheduleEnabled: true,
+  webhookScheduleIntervalDays: true,
+  webhookScheduleNextRunAt: true,
+  webhookScheduleLastRunAt: true,
+};
+
+function serializeWebhookSchedule(client) {
+  return {
+    clientId: client.id,
+    enabled: client.webhookScheduleEnabled,
+    intervalDays: client.webhookScheduleIntervalDays ?? null,
+    nextRunAt: client.webhookScheduleNextRunAt ?? null,
+    lastRunAt: client.webhookScheduleLastRunAt ?? null,
+    timeZone: webhookScheduleOptions.timeZone,
+    hour: webhookScheduleOptions.hour,
+  };
+}
+
+function serializeDeploymentSummary(deployment) {
+  if (!deployment) return null;
+  return {
+    runId: deployment.runId,
+    status: deployment.status,
+    triggerSource: deployment.triggerSource,
+    startedAt: deployment.startedAt,
+    completedAt: deployment.completedAt,
+    durationMs: deployment.durationMs,
+    failureReason: deployment.failureReason,
+  };
+}
+
+async function serializeWebhookHealthRun(run) {
+  const deploymentRunIds = [...new Set(
+    (run.checks || [])
+      .map((check) => check.deploymentRunId)
+      .filter((runId) => typeof runId === 'string' && runId),
+  )];
+  const deployments = deploymentRunIds.length
+    ? await prisma.deployment.findMany({
+      where: { runId: { in: deploymentRunIds } },
+      select: {
+        runId: true,
+        status: true,
+        triggerSource: true,
+        startedAt: true,
+        completedAt: true,
+        durationMs: true,
+        failureReason: true,
+      },
+    })
+    : [];
+  const deploymentsByRunId = new Map(deployments.map((deployment) => [deployment.runId, deployment]));
+  const checks = [...(run.checks || [])].sort((left, right) =>
+    (left.service?.name || '').localeCompare(right.service?.name || ''),
+  );
+
+  return {
+    id: run.id,
+    clientId: run.clientId,
+    source: run.source,
+    status: run.status,
+    requestedBy: run.requestedBy,
+    totalServices: run.totalServices,
+    successfulServices: run.successfulServices,
+    failedServices: run.failedServices,
+    startedAt: run.startedAt,
+    completedAt: run.completedAt,
+    checks: checks.map((check) => ({
+      id: check.id,
+      serviceId: check.serviceId,
+      service: check.service,
+      status: check.status,
+      httpStatus: check.httpStatus,
+      message: check.message,
+      startedAt: check.startedAt,
+      completedAt: check.completedAt,
+      durationMs: check.durationMs,
+      deployment: serializeDeploymentSummary(deploymentsByRunId.get(check.deploymentRunId)),
+    })),
+  };
+}
+
+async function loadWebhookHealth(clientId) {
+  const [client, latestRun, recentRuns] = await Promise.all([
+    prisma.client.findUnique({ where: { id: clientId }, select: webhookScheduleClientSelect }),
+    prisma.webhookHealthRun.findFirst({
+      where: { clientId },
+      orderBy: { startedAt: 'desc' },
+      include: {
+        checks: {
+          include: { service: { select: webhookHealthServiceSelect } },
+          orderBy: { createdAt: 'asc' },
+        },
+      },
+    }),
+    prisma.webhookHealthRun.findMany({
+      where: { clientId },
+      orderBy: { startedAt: 'desc' },
+      take: 5,
+      select: {
+        id: true,
+        source: true,
+        status: true,
+        totalServices: true,
+        successfulServices: true,
+        failedServices: true,
+        startedAt: true,
+        completedAt: true,
+      },
+    }),
+  ]);
+
+  if (!client || !client.enabled) return null;
+  const serializedLatestRun = latestRun ? await serializeWebhookHealthRun(latestRun) : null;
+  return {
+    schedule: serializeWebhookSchedule(client),
+    latestRun: serializedLatestRun,
+    activeRun: serializedLatestRun?.status === 'RUNNING' ? serializedLatestRun : null,
+    recentRuns,
+  };
+}
+
+function requestedWebhookClientId(req, source) {
+  if (req.user?.role === 'CLIENT') return req.user.clientId;
+  if (req.user?.role !== 'SUPER_ADMIN') return null;
+  const candidate = source === 'query' ? req.query.clientId : req.body?.clientId;
+  return typeof candidate === 'string' && candidate ? candidate : null;
+}
+
+function webhookCheckDuration(startedAt, completedAt) {
+  if (!startedAt || !completedAt) return null;
+  return Math.max(new Date(completedAt).getTime() - new Date(startedAt).getTime(), 0);
+}
+
+async function refreshWebhookRunProgress(runId) {
+  const checks = await prisma.webhookHealthCheck.findMany({
+    where: { runId },
+    select: { status: true },
+  });
+  await prisma.webhookHealthRun.updateMany({
+    where: { id: runId, status: 'RUNNING' },
+    data: {
+      successfulServices: checks.filter((check) => check.status === 'SUCCESS').length,
+      failedServices: checks.filter((check) => check.status === 'FAILED').length,
+    },
+  });
+}
+
+async function failWebhookCheck(checkId, message, httpStatus, startedAt = null) {
+  const completedAt = new Date();
+  await prisma.webhookHealthCheck.update({
+    where: { id: checkId },
+    data: {
+      status: 'FAILED',
+      httpStatus: httpStatus ?? null,
+      message: String(message || 'Webhook check failed').slice(0, 2000),
+      completedAt,
+      durationMs: webhookCheckDuration(startedAt, completedAt),
+    },
+  });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForWebhookCheckResult({ runId, checkId, deploymentRunId, httpStatus, startedAt }) {
+  const deadline = Date.now() + webhookHealthTimeoutMs;
+
+  while (true) {
+    const deployment = await prisma.deployment.findUnique({
+      where: { runId: deploymentRunId },
+      select: {
+        status: true,
+        completedAt: true,
+        failureReason: true,
+      },
+    });
+
+    if (deployment && deployment.status !== 'DEPLOYING') {
+      const completedAt = deployment.completedAt || new Date();
+      if (deployment.status === 'SUCCESS') {
+        await prisma.webhookHealthCheck.update({
+          where: { id: checkId },
+          data: {
+            status: 'SUCCESS',
+            message: 'Deployment completed successfully',
+            completedAt,
+            durationMs: webhookCheckDuration(startedAt, completedAt),
+          },
+        });
+      } else {
+        await prisma.webhookHealthCheck.update({
+          where: { id: checkId },
+          data: {
+            status: 'FAILED',
+            message: (deployment.failureReason || `Deployment finished with ${deployment.status}`).slice(0, 2000),
+            completedAt,
+            durationMs: webhookCheckDuration(startedAt, completedAt),
+          },
+        });
+      }
+      await refreshWebhookRunProgress(runId);
+      return;
+    }
+
+    if (Date.now() >= deadline) {
+      await failWebhookCheck(
+        checkId,
+        'Timed out waiting for the pipeline deployment result',
+        httpStatus,
+        startedAt,
+      );
+      await refreshWebhookRunProgress(runId);
+      return;
+    }
+
+    await sleep(Math.min(webhookHealthPollMs, Math.max(deadline - Date.now(), 250)));
+  }
+}
+
+async function finalizeWebhookHealthRun(runId, actorEmail) {
+  const checks = await prisma.webhookHealthCheck.findMany({
+    where: { runId },
+    select: { status: true },
+  });
+  const successfulServices = checks.filter((check) => check.status === 'SUCCESS').length;
+  const failedServices = checks.length - successfulServices;
+  const status = checks.length > 0 && successfulServices === checks.length
+    ? 'SUCCESS'
+    : successfulServices > 0
+      ? 'PARTIAL'
+      : 'FAILED';
+
+  const run = await prisma.webhookHealthRun.update({
+    where: { id: runId },
+    data: {
+      status,
+      successfulServices,
+      failedServices,
+      completedAt: new Date(),
+    },
+  });
+
+  await writeAudit(actorEmail, 'WEBHOOK_HEALTH_RUN_COMPLETED', 'WebhookHealthRun', run.id, {
+    clientId: run.clientId,
+    status: run.status,
+    successfulServices,
+    failedServices,
+  });
+  return run;
+}
+
+async function executeWebhookHealthRun({ runId, client, services, requestedBy }) {
+  const servicesById = new Map(services.map((service) => [service.id, service]));
+
+  try {
+    const checks = await prisma.webhookHealthCheck.findMany({
+      where: { runId },
+      orderBy: { createdAt: 'asc' },
+    });
+    checks.sort((left, right) =>
+      (servicesById.get(left.serviceId)?.name || '').localeCompare(servicesById.get(right.serviceId)?.name || ''),
+    );
+
+    for (const check of checks) {
+      const service = servicesById.get(check.serviceId);
+      if (!service || !service.enabled || !service.agent?.enabled) {
+        await failWebhookCheck(check.id, 'Service or its pipeline agent is disabled', null);
+        await refreshWebhookRunProgress(runId);
+        continue;
+      }
+
+      const startedAt = new Date();
+      await prisma.webhookHealthCheck.update({
+        where: { id: check.id },
+        data: {
+          status: 'RUNNING',
+          startedAt,
+          completedAt: null,
+          durationMs: null,
+          httpStatus: null,
+          message: 'Calling the pipeline webhook',
+        },
+      });
+
+      let result;
+      try {
+        result = await requestServiceDeployment(service, {
+          requestedBy,
+          runId: `health-${crypto.randomUUID()}`,
+          source: 'console',
+        });
+      } catch (error) {
+        result = {
+          ok: false,
+          httpStatus: 502,
+          body: JSON.stringify({ message: error.message }),
+          parsed: { message: error.message },
+          deploymentRunId: null,
+        };
+      }
+
+      if (!result.ok) {
+        await failWebhookCheck(
+          check.id,
+          upstreamMessage(result.parsed, result.body),
+          result.httpStatus,
+          startedAt,
+        );
+        await refreshWebhookRunProgress(runId);
+        continue;
+      }
+
+      await prisma.webhookHealthCheck.update({
+        where: { id: check.id },
+        data: {
+          status: 'RUNNING',
+          httpStatus: result.httpStatus,
+          deploymentRunId: result.deploymentRunId,
+          message: 'Webhook accepted; waiting for the pipeline deployment',
+        },
+      });
+      await refreshWebhookRunProgress(runId);
+      await waitForWebhookCheckResult({
+        runId,
+        checkId: check.id,
+        deploymentRunId: result.deploymentRunId,
+        httpStatus: result.httpStatus,
+        startedAt,
+      });
+    }
+
+    await finalizeWebhookHealthRun(runId, requestedBy || client.email);
+  } catch (error) {
+    console.error(`Webhook health run ${runId} failed:`, error);
+    const completedAt = new Date();
+    await prisma.webhookHealthCheck.updateMany({
+      where: { runId, status: { in: ['QUEUED', 'RUNNING'] } },
+      data: {
+        status: 'FAILED',
+        message: `Health check runner failed: ${error.message}`.slice(0, 2000),
+        completedAt,
+      },
+    });
+    const failedChecks = await prisma.webhookHealthCheck.findMany({
+      where: { runId },
+      select: { status: true },
+    }).catch(() => []);
+    const successfulServices = failedChecks.filter((check) => check.status === 'SUCCESS').length;
+    await prisma.webhookHealthRun.update({
+      where: { id: runId },
+      data: {
+        status: successfulServices > 0 ? 'PARTIAL' : 'FAILED',
+        successfulServices,
+        failedServices: failedChecks.length - successfulServices,
+        completedAt,
+      },
+    }).catch(() => {});
+  } finally {
+    activeWebhookClients.delete(client.id);
+  }
+}
+
+async function startWebhookHealthRun({ client, source, requestedBy }) {
+  if (activeWebhookClients.has(client.id)) {
+    const activeRun = await prisma.webhookHealthRun.findFirst({
+      where: { clientId: client.id, status: 'RUNNING' },
+      orderBy: { startedAt: 'desc' },
+    });
+    return { conflict: activeRun || { status: 'RUNNING', clientId: client.id } };
+  }
+
+  activeWebhookClients.add(client.id);
+  try {
+    const activeRun = await prisma.webhookHealthRun.findFirst({
+      where: { clientId: client.id, status: 'RUNNING' },
+      orderBy: { startedAt: 'desc' },
+    });
+    if (activeRun) {
+      activeWebhookClients.delete(client.id);
+      return { conflict: activeRun };
+    }
+
+    const services = await prisma.service.findMany({
+      where: { clientId: client.id, enabled: true },
+      include: { agent: true },
+      orderBy: { name: 'asc' },
+    });
+    if (services.length === 0) {
+      activeWebhookClients.delete(client.id);
+      return { error: 'No enabled services are available for a webhook health check' };
+    }
+
+    const run = await prisma.webhookHealthRun.create({
+      data: {
+        clientId: client.id,
+        source,
+        requestedBy,
+        totalServices: services.length,
+        checks: { create: services.map((service) => ({ serviceId: service.id })) },
+      },
+      include: {
+        checks: {
+          include: { service: { select: webhookHealthServiceSelect } },
+          orderBy: { createdAt: 'asc' },
+        },
+      },
+    });
+
+    await prisma.client.update({
+      where: { id: client.id },
+      data: { webhookScheduleLastRunAt: new Date() },
+    });
+
+    void executeWebhookHealthRun({
+      runId: run.id,
+      client,
+      services,
+      requestedBy,
+    }).catch((error) => {
+      console.error(`Unhandled webhook health run error for ${run.id}:`, error);
+    });
+
+    return { run };
+  } catch (error) {
+    activeWebhookClients.delete(client.id);
+    throw error;
+  }
+}
+
+app.get('/api/webhook-health', requireAuth, async (req, res, next) => {
+  try {
+    const clientId = requestedWebhookClientId(req, 'query');
+    if (!clientId) return res.status(400).json({ message: 'clientId is required for super-admin access' });
+    const health = await loadWebhookHealth(clientId);
+    if (!health) return res.status(404).json({ message: 'Client not found' });
+    res.json(health);
+  } catch (error) { next(error); }
+});
+
+app.patch('/api/webhook-health/schedule', requireAuth, async (req, res, next) => {
+  try {
+    const clientId = requestedWebhookClientId(req, 'body');
+    if (!clientId) return res.status(400).json({ message: 'clientId is required for super-admin access' });
+    const parsed = z.object({
+      enabled: z.boolean(),
+      intervalDays: z.coerce.number().int().min(1).max(365).optional(),
+    }).safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ message: 'Interval must be between 1 and 365 days', issues: parsed.error.issues });
+    }
+
+    const client = await prisma.client.findUnique({
+      where: { id: clientId },
+      select: webhookScheduleClientSelect,
+    });
+    if (!client) return res.status(404).json({ message: 'Client not found' });
+    if (!client.enabled) return res.status(403).json({ message: 'Client account is disabled' });
+
+    const intervalDays = parsed.data.intervalDays ?? client.webhookScheduleIntervalDays;
+    if (parsed.data.enabled && !intervalDays) {
+      return res.status(400).json({ message: 'Choose an interval before enabling automatic webhook checks' });
+    }
+
+    let nextRunAt = null;
+    if (parsed.data.enabled) {
+      const intervalChanged = intervalDays !== client.webhookScheduleIntervalDays;
+      nextRunAt = client.webhookScheduleEnabled && !intervalChanged && client.webhookScheduleNextRunAt
+        ? client.webhookScheduleNextRunAt
+        : nextScheduledRun(new Date(), webhookScheduleOptions);
+    }
+
+    const updated = await prisma.client.update({
+      where: { id: client.id },
+      data: {
+        webhookScheduleEnabled: parsed.data.enabled,
+        webhookScheduleIntervalDays: intervalDays ?? null,
+        webhookScheduleNextRunAt: nextRunAt,
+      },
+      select: webhookScheduleClientSelect,
+    });
+
+    await writeAudit(req.user.email, 'WEBHOOK_SCHEDULE_UPDATED', 'Client', client.id, {
+      enabled: updated.webhookScheduleEnabled,
+      intervalDays: updated.webhookScheduleIntervalDays,
+      nextRunAt: updated.webhookScheduleNextRunAt?.toISOString() ?? null,
+    });
+    res.json({ schedule: serializeWebhookSchedule(updated) });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/webhook-health/run', requireAuth, async (req, res, next) => {
+  try {
+    const clientId = requestedWebhookClientId(req, 'body');
+    if (!clientId) return res.status(400).json({ message: 'clientId is required for super-admin access' });
+    const client = await prisma.client.findUnique({
+      where: { id: clientId },
+      select: webhookScheduleClientSelect,
+    });
+    if (!client) return res.status(404).json({ message: 'Client not found' });
+    if (!client.enabled) return res.status(403).json({ message: 'Client account is disabled' });
+
+    const result = await startWebhookHealthRun({
+      client,
+      source: 'MANUAL',
+      requestedBy: req.user.email,
+    });
+    if (result.conflict) {
+      return res.status(409).json({
+        message: 'A webhook health check is already running for this client',
+        run: result.conflict,
+      });
+    }
+    if (result.error) return res.status(400).json({ message: result.error });
+
+    await writeAudit(req.user.email, 'WEBHOOK_HEALTH_RUN_REQUESTED', 'WebhookHealthRun', result.run.id, {
+      clientId: client.id,
+      source: 'MANUAL',
+    });
+    res.status(202).json({ run: await serializeWebhookHealthRun(result.run) });
   } catch (error) { next(error); }
 });
 
@@ -226,6 +1011,7 @@ app.get('/api/services/:serviceId/pm2/logs/stream', requireAuth, async (req, res
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
     const reader = upstream.body.getReader();
     req.on('close', () => reader.cancel().catch(() => {}));
     while (true) {
@@ -249,9 +1035,83 @@ app.get('/api/services/:serviceId/pm2/status', requireAuth, async (req, res, nex
   } catch (error) { next(error); }
 });
 
+app.get('/api/admin/access', requireAuth, requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const entries = await prisma.clientAccess.findMany({
+      include: { client: { select: { id: true, name: true, email: true } } },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json({ access: entries.map(serializeClientAccess) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/admin/access', requireAuth, requireSuperAdmin, async (req, res, next) => {
+  try {
+    const input = accessCreateSchema.parse(req.body);
+    const values = accessRecordValues(input);
+    const validationError = validateAccessShape(values.type, values.path, values.databaseName);
+    if (validationError) return res.status(400).json({ message: validationError });
+    const client = await prisma.client.findUnique({ where: { id: input.clientId } });
+    if (!client) return res.status(404).json({ message: 'Client not found' });
+
+    const entry = await prisma.clientAccess.create({
+      data: {
+        ...values,
+        clientId: input.clientId,
+        passwordEncrypted: encryptSecret(input.password),
+      },
+      include: { client: { select: { id: true, name: true, email: true } } },
+    });
+    await writeAudit(req.user.email, 'ACCESS_CREATED', 'ClientAccess', entry.id, accessAuditMetadata(entry));
+    res.status(201).json({ access: serializeClientAccess(entry) });
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ message: 'Invalid access details', issues: error.issues });
+    next(error);
+  }
+});
+
+app.patch('/api/admin/access/:accessId', requireAuth, requireSuperAdmin, async (req, res, next) => {
+  try {
+    const existing = await prisma.clientAccess.findUnique({ where: { id: req.params.accessId } });
+    if (!existing) return res.status(404).json({ message: 'Access entry not found' });
+    const input = accessUpdateSchema.parse(req.body);
+    const values = accessRecordValues(input, existing);
+    const validationError = validateAccessShape(values.type, values.path, values.databaseName);
+    if (validationError) return res.status(400).json({ message: validationError });
+
+    const entry = await prisma.clientAccess.update({
+      where: { id: existing.id },
+      data: {
+        ...values,
+        ...(input.password ? { passwordEncrypted: encryptSecret(input.password) } : {}),
+      },
+      include: { client: { select: { id: true, name: true, email: true } } },
+    });
+    await writeAudit(req.user.email, 'ACCESS_UPDATED', 'ClientAccess', entry.id, accessAuditMetadata(entry));
+    res.json({ access: serializeClientAccess(entry) });
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ message: 'Invalid access details', issues: error.issues });
+    next(error);
+  }
+});
+
+app.delete('/api/admin/access/:accessId', requireAuth, requireSuperAdmin, async (req, res, next) => {
+  try {
+    const existing = await prisma.clientAccess.findUnique({ where: { id: req.params.accessId } });
+    if (!existing) return res.status(404).json({ message: 'Access entry not found' });
+    await prisma.clientAccess.delete({ where: { id: existing.id } });
+    await writeAudit(req.user.email, 'ACCESS_DELETED', 'ClientAccess', existing.id, accessAuditMetadata(existing));
+    res.json({ deleted: true, accessId: existing.id });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get('/api/admin/clients', requireAuth, requireSuperAdmin, async (_req, res, next) => {
   try {
-    const clients = await prisma.client.findMany({ include: { _count: { select: { services: true } } }, orderBy: { createdAt: 'desc' } });
+    const clients = await prisma.client.findMany({ include: { _count: { select: { services: true, accessEntries: true } } }, orderBy: { createdAt: 'desc' } });
     res.json({ clients: clients.map(({ passwordHash, ...client }) => client) });
   } catch (error) { next(error); }
 });
@@ -309,6 +1169,25 @@ app.post('/api/admin/agents', requireAuth, requireSuperAdmin, async (req, res, n
     res.status(201).json({ agent: { id: agent.id, name: agent.name, baseUrl: agent.baseUrl }, enrollmentToken });
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ message: 'Invalid agent details', issues: error.issues });
+    next(error);
+  }
+});
+
+app.post('/api/admin/agents/:agentId/enrollment-token', requireAuth, requireSuperAdmin, async (req, res, next) => {
+  try {
+    const agent = await prisma.serverAgent.findUnique({ where: { id: req.params.agentId } });
+    if (!agent) return res.status(404).json({ message: 'Agent not found' });
+
+    const enrollmentToken = crypto.randomBytes(32).toString('hex');
+    await prisma.serverAgent.update({
+      where: { id: agent.id },
+      data: { enrollmentToken },
+    });
+    await writeAudit(req.user.email, 'AGENT_ENROLLMENT_TOKEN_REGENERATED', 'ServerAgent', agent.id, {
+      agentId: agent.id,
+    });
+    res.json({ agentId: agent.id, enrollmentToken });
+  } catch (error) {
     next(error);
   }
 });
@@ -418,12 +1297,14 @@ app.post('/api/agents/:agentId/events', requireAgentKey, async (req, res, next) 
       branch: z.string().optional(),
       commitMessage: z.string().optional(),
       failureReason: z.string().optional(),
+      triggerSource: z.enum(['console', 'webhook']).optional(),
+      deployerEmail: z.string().email().optional(),
       timestamp: z.string().datetime().optional(),
     }).parse(req.body);
     const service = await prisma.service.findFirst({ where: { projectKey: input.projectKey, agentId: agent.id } });
     if (!service) return res.status(404).json({ message: 'Service is not registered to this agent' });
     if (input.type === 'deployment-started') {
-      await prisma.deployment.upsert({ where: { runId: input.runId }, create: { runId: input.runId, serviceId: service.id, agentId: agent.id, triggerSource: 'webhook', status: 'DEPLOYING', commitHash: input.commitHash, branch: input.branch, commitMessage: input.commitMessage }, update: {} });
+      await prisma.deployment.upsert({ where: { runId: input.runId }, create: { runId: input.runId, serviceId: service.id, agentId: agent.id, triggerSource: input.triggerSource || 'webhook', deployerEmail: input.deployerEmail, status: 'DEPLOYING', commitHash: input.commitHash, branch: input.branch, commitMessage: input.commitMessage }, update: {} });
     } else {
       const deployment = await prisma.deployment.findUnique({ where: { runId: input.runId } });
       if (!deployment) return res.status(404).json({ message: 'Deployment run not found' });
@@ -440,6 +1321,116 @@ app.post('/api/agents/:agentId/events', requireAgentKey, async (req, res, next) 
     next(error);
   }
 });
+
+let webhookSchedulerBusy = false;
+
+async function runDueWebhookSchedules() {
+  const now = new Date();
+  const dueClients = await prisma.client.findMany({
+    where: {
+      enabled: true,
+      webhookScheduleEnabled: true,
+      webhookScheduleIntervalDays: { not: null },
+      webhookScheduleNextRunAt: { lte: now },
+    },
+    select: webhookScheduleClientSelect,
+  });
+
+  for (const client of dueClients) {
+    const intervalDays = client.webhookScheduleIntervalDays;
+    if (!intervalDays) continue;
+
+    const nextRunAt = nextScheduledRunAfter(
+      client.webhookScheduleNextRunAt || now,
+      intervalDays,
+      now,
+      webhookScheduleOptions,
+    );
+    await prisma.client.update({
+      where: { id: client.id },
+      data: { webhookScheduleNextRunAt: nextRunAt },
+    });
+
+    try {
+      const result = await startWebhookHealthRun({
+        client,
+        source: 'SCHEDULED',
+        requestedBy: schedulerEmail,
+      });
+      if (result.conflict) {
+        console.log(`Skipped scheduled webhook health check for ${client.email}: a run is already active`);
+        continue;
+      }
+      if (result.error) {
+        console.log(`Skipped scheduled webhook health check for ${client.email}: ${result.error}`);
+        continue;
+      }
+      await writeAudit(schedulerEmail, 'WEBHOOK_HEALTH_RUN_SCHEDULED', 'WebhookHealthRun', result.run.id, {
+        clientId: client.id,
+        nextRunAt: nextRunAt.toISOString(),
+      });
+    } catch (error) {
+      console.error(`Scheduled webhook health check failed for ${client.email}:`, error);
+    }
+  }
+}
+
+function startWebhookScheduler() {
+  const tick = () => {
+    if (webhookSchedulerBusy) return;
+    webhookSchedulerBusy = true;
+    runDueWebhookSchedules()
+      .catch((error) => console.error('Webhook schedule check failed:', error.message))
+      .finally(() => {
+        webhookSchedulerBusy = false;
+      });
+  };
+
+  setTimeout(tick, 5000).unref();
+  setInterval(tick, 60 * 1000).unref();
+}
+
+async function reconcileInterruptedWebhookRuns() {
+  const runs = await prisma.webhookHealthRun.findMany({
+    where: { status: 'RUNNING' },
+    select: { id: true, requestedBy: true },
+  });
+  if (runs.length === 0) return;
+
+  const completedAt = new Date();
+  for (const run of runs) {
+    await prisma.webhookHealthCheck.updateMany({
+      where: { runId: run.id, status: { in: ['QUEUED', 'RUNNING'] } },
+      data: {
+        status: 'FAILED',
+        message: 'Health check was interrupted by a console restart',
+        completedAt,
+      },
+    });
+    const checks = await prisma.webhookHealthCheck.findMany({
+      where: { runId: run.id },
+      select: { status: true },
+    });
+    const successfulServices = checks.filter((check) => check.status === 'SUCCESS').length;
+    const failedServices = checks.length - successfulServices;
+    const status = checks.length > 0 && successfulServices === checks.length
+      ? 'SUCCESS'
+      : successfulServices > 0
+        ? 'PARTIAL'
+        : 'FAILED';
+    await prisma.webhookHealthRun.update({
+      where: { id: run.id },
+      data: {
+        status,
+        successfulServices,
+        failedServices,
+        completedAt,
+      },
+    });
+  }
+
+  console.log(`Reconciled ${runs.length} interrupted webhook health run(s)`);
+}
 
 const pm2Actions = new Set(['start', 'stop', 'restart', 'reload']);
 
@@ -461,7 +1452,11 @@ app.use((error, _req, res, _next) => {
   res.status(500).json({ message: 'Internal server error' });
 });
 
+await reconcileInterruptedWebhookRuns().catch((error) => {
+  console.error('Unable to reconcile interrupted webhook health runs:', error.message);
+});
 const server = app.listen(port, () => console.log(`HexTorq API listening on port ${port}`));
+startWebhookScheduler();
 
 async function shutdown(signal) {
   console.log(`${signal} received; shutting down`);
