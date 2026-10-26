@@ -89,6 +89,7 @@ model Service {
   repositoryUrl       String
   branch              String               @default("main")
   projectKey          String               @unique
+  webhookUrl          String?
   workingDirectory    String
   deployDirectory     String?
   pm2ProcessName      String?

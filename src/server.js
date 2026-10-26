@@ -363,6 +363,7 @@ function serviceDeploymentConfig(service) {
     repositoryUrl: service.repositoryUrl,
     branch: service.branch,
     projectKey: service.projectKey,
+    webhookUrl: service.webhookUrl,
     workingDirectory: service.workingDirectory,
     deployDirectory: service.deployDirectory,
     enabled: service.enabled,
@@ -1120,6 +1121,34 @@ app.get('/api/templates', requireAuth, (_req, res) => {
   res.json({ templates: serviceTemplates });
 });
 
+app.get('/api/admin/agents/:agentId/pm2/processes', requireAuth, requireSuperAdmin, async (req, res, next) => {
+  try {
+    const agent = await prisma.serverAgent.findUnique({ where: { id: req.params.agentId } });
+    if (!agent?.enabled || !agent.apiKeyEncrypted) return res.status(404).json({ message: 'Enabled enrolled agent not found' });
+    const response = await fetch(agentUrl(agent, '/pm2/processes'), {
+      headers: { 'X-Console-Agent-Id': agent.id, 'X-Console-Agent-Key': decryptAgentKey(agent.apiKeyEncrypted) },
+      signal: AbortSignal.timeout(15 * 1000),
+    });
+    const body = await response.text();
+    res.status(response.status).type('application/json').send(body);
+  } catch (error) { next(error); }
+});
+
+app.get('/api/admin/repository-metadata', requireAuth, requireSuperAdmin, async (req, res, next) => {
+  try {
+    const value = String(req.query.url || '').trim();
+    const match = value.match(/^https?:\/\/github\.com\/([^/]+)\/([^/#?]+?)(?:\.git)?\/?$/i);
+    if (!match) return res.status(400).json({ message: 'Only GitHub repository URLs are supported for automatic metadata' });
+    const response = await fetch(`https://api.github.com/repos/${encodeURIComponent(match[1])}/${encodeURIComponent(match[2])}`, {
+      headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'HexTorq-Cloud-Console' },
+      signal: AbortSignal.timeout(10 * 1000),
+    });
+    if (!response.ok) return res.status(400).json({ message: 'GitHub repository could not be found' });
+    const repository = await response.json();
+    res.json({ slug: String(repository.name || match[2]).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''), branch: repository.default_branch || 'main' });
+  } catch (error) { next(error); }
+});
+
 app.post('/api/admin/clients', requireAuth, requireSuperAdmin, async (req, res, next) => {
   try {
     const input = z.object({ name: z.string().min(2), email: z.string().email(), temporaryPassword: z.string().min(8).optional() }).parse(req.body);
@@ -1201,6 +1230,7 @@ app.post('/api/admin/services', requireAuth, requireSuperAdmin, async (req, res,
       repositoryUrl: z.string().url(),
       branch: z.string().min(1).default('main'),
       projectKey: z.string().regex(/^[a-zA-Z0-9_.-]+$/),
+      webhookUrl: z.string().url().optional(),
       workingDirectory: z.string().min(1),
       deployDirectory: z.string().optional(),
       pm2ProcessName: z.string().optional(),
@@ -1224,7 +1254,7 @@ app.post('/api/admin/services', requireAuth, requireSuperAdmin, async (req, res,
 
 app.patch('/api/admin/services/:serviceId', requireAuth, requireSuperAdmin, async (req, res, next) => {
   try {
-    const input = z.object({ name: z.string().min(2).optional(), branch: z.string().min(1).optional(), enabled: z.boolean().optional(), templateKey: z.string().optional(), customCommands: z.record(z.string(), z.string()).optional(), pm2ProcessName: z.string().optional(), deployDirectory: z.string().optional() }).parse(req.body);
+    const input = z.object({ name: z.string().min(2).optional(), branch: z.string().min(1).optional(), webhookUrl: z.string().url().optional().nullable(), enabled: z.boolean().optional(), templateKey: z.string().optional(), customCommands: z.record(z.string(), z.string()).optional(), pm2ProcessName: z.string().optional(), deployDirectory: z.string().optional() }).parse(req.body);
     const service = await prisma.service.update({ where: { id: req.params.serviceId }, data: input });
     await writeAudit(req.user.email, 'SERVICE_UPDATED', 'Service', service.id, input);
     res.json({ service });
