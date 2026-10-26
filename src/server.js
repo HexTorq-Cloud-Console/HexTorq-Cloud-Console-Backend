@@ -1360,7 +1360,7 @@ app.post('/api/agents/:agentId/events', requireAgentKey, async (req, res, next) 
       if (input.type === 'deployment-log' && input.message) await prisma.deploymentLog.create({ data: { deploymentId: deployment.id, message: input.message, timestamp: input.timestamp ? new Date(input.timestamp) : undefined } });
       if (input.type === 'deployment-completed') {
         const completedAt = input.timestamp ? new Date(input.timestamp) : new Date();
-        await prisma.deployment.update({ where: { id: deployment.id }, data: { status: input.status || 'ERROR', completedAt, durationMs: completedAt.getTime() - deployment.startedAt.getTime(), failureReason: input.failureReason } });
+        await prisma.deployment.update({ where: { id: deployment.id }, data: { status: input.status || 'ERROR', completedAt, durationMs: completedAt.getTime() - deployment.startedAt.getTime(), failureReason: input.failureReason, commitHash: input.commitHash || undefined, commitMessage: input.commitMessage || undefined, branch: input.branch || undefined } });
       }
     }
     await prisma.serverAgent.update({ where: { id: agent.id }, data: { lastSeenAt: new Date() } });
