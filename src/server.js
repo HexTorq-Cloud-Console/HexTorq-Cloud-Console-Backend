@@ -386,7 +386,7 @@ function upstreamMessage(parsed, body) {
   return String(message || 'Pipeline request failed').slice(0, 2000);
 }
 
-async function requestServiceDeployment(service, { requestedBy, runId, source = 'console' } = {}) {
+async function requestServiceDeployment(service, { requestedBy, runId, source = 'console', force = false } = {}) {
   if (!service.agent?.apiKeyEncrypted) {
     return {
       ok: false,
@@ -409,6 +409,7 @@ async function requestServiceDeployment(service, { requestedBy, runId, source = 
         source,
         requestedBy,
         runId,
+        force,
         service: serviceDeploymentConfig(service),
       }),
       signal: AbortSignal.timeout(30 * 1000),
@@ -441,6 +442,7 @@ app.post('/api/services/:serviceId/deploy', requireAuth, async (req, res, next) 
       requestedBy: req.user.email,
       runId,
       source: 'console',
+      force: req.body?.force === true,
     });
     if (!result.ok) {
       return res.status(result.httpStatus === 409 ? 409 : 502).json({
@@ -451,6 +453,7 @@ app.post('/api/services/:serviceId/deploy', requireAuth, async (req, res, next) 
     }
     await writeAudit(req.user.email, 'DEPLOYMENT_REQUESTED', 'Service', service.id, {
       triggerSource: 'console',
+      force: req.body?.force === true,
       runId: result.deploymentRunId,
     });
     res.status(202).json({
