@@ -383,7 +383,7 @@ function parseJsonBody(body) {
 
 function upstreamMessage(parsed, body) {
   const message = typeof parsed?.message === 'string' ? parsed.message : body;
-  return String(message || 'Pipeline request failed').slice(0, 2000);
+  return String(message || 'Pipeline request failed').slice(0, 10000);
 }
 
 async function requestServiceDeployment(service, { requestedBy, runId, source = 'console', force = false } = {}) {
@@ -515,6 +515,7 @@ function serializeWebhookSchedule(client) {
 function serializeDeploymentSummary(deployment) {
   if (!deployment) return null;
   return {
+    id: deployment.id,
     runId: deployment.runId,
     status: deployment.status,
     triggerSource: deployment.triggerSource,
@@ -535,6 +536,7 @@ async function serializeWebhookHealthRun(run) {
     ? await prisma.deployment.findMany({
       where: { runId: { in: deploymentRunIds } },
       select: {
+        id: true,
         runId: true,
         status: true,
         triggerSource: true,
@@ -649,7 +651,7 @@ async function failWebhookCheck(checkId, message, httpStatus, startedAt = null) 
     data: {
       status: 'FAILED',
       httpStatus: httpStatus ?? null,
-      message: String(message || 'Webhook check failed').slice(0, 2000),
+       message: String(message || 'Webhook check failed').slice(0, 10000),
       completedAt,
       durationMs: webhookCheckDuration(startedAt, completedAt),
     },
@@ -690,7 +692,7 @@ async function waitForWebhookCheckResult({ runId, checkId, deploymentRunId, http
           where: { id: checkId },
           data: {
             status: 'FAILED',
-            message: (deployment.failureReason || `Deployment finished with ${deployment.status}`).slice(0, 2000),
+             message: (deployment.failureReason || `Deployment finished with ${deployment.status}`).slice(0, 10000),
             completedAt,
             durationMs: webhookCheckDuration(startedAt, completedAt),
           },
@@ -835,7 +837,7 @@ async function executeWebhookHealthRun({ runId, client, services, requestedBy })
       where: { runId, status: { in: ['QUEUED', 'RUNNING'] } },
       data: {
         status: 'FAILED',
-        message: `Health check runner failed: ${error.message}`.slice(0, 2000),
+         message: `Health check runner failed: ${error.message}`.slice(0, 10000),
         completedAt,
       },
     });
