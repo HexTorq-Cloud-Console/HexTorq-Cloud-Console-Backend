@@ -1404,7 +1404,16 @@ app.post('/api/agents/:agentId/events', requireAgentKey, async (req, res, next) 
       deployerEmail: z.string().email().optional(),
       timestamp: z.string().datetime().optional(),
     }).parse(req.body);
-    const service = await prisma.service.findFirst({ where: { projectKey: input.projectKey, agentId: agent.id } });
+    const service = await prisma.service.findFirst({
+      where: {
+        agentId: agent.id,
+        OR: [
+          { projectKey: input.projectKey },
+          { templateKey: input.projectKey },
+        ],
+      },
+      orderBy: { projectKey: 'asc' },
+    });
     if (!service) return res.status(404).json({ message: 'Service is not registered to this agent' });
     if (input.type === 'deployment-started') {
       await prisma.deployment.upsert({ where: { runId: input.runId }, create: { runId: input.runId, serviceId: service.id, agentId: agent.id, triggerSource: input.triggerSource || 'webhook', deployerEmail: input.deployerEmail, status: 'DEPLOYING', commitHash: input.commitHash, branch: input.branch, commitMessage: input.commitMessage }, update: { status: 'DEPLOYING', deployerEmail: input.deployerEmail, branch: input.branch, commitHash: input.commitHash, commitMessage: input.commitMessage } });
