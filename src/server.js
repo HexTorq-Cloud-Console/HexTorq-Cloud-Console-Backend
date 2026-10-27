@@ -279,6 +279,12 @@ async function registerServiceWithPipeline(service) {
   return JSON.parse(body || '{}');
 }
 
+function publicServiceAgent(agent) {
+  if (!agent) return agent;
+  const { apiKeyEncrypted, apiKeyHash, enrollmentToken, ...safeAgent } = agent;
+  return safeAgent;
+}
+
 async function getAccessibleService(req, serviceId) {
   const service = await prisma.service.findUnique({ where: { id: serviceId }, include: { agent: true, client: true } });
   if (!service || !service.enabled || !service.agent.enabled || (req.user.role === 'CLIENT' && service.clientId !== req.user.clientId)) return null;
@@ -1306,8 +1312,7 @@ app.post('/api/admin/services', requireAuth, requireSuperAdmin, async (req, res,
     } catch (error) {
       pipelineRegistration = { registered: false, message: error.message };
     }
-    const { apiKeyEncrypted: _createdAgentKey, ...createdAgent } = service.agent || {};
-    res.status(201).json({ service: { ...service, agent: createdAgent }, pipelineRegistration });
+    res.status(201).json({ service: { ...service, agent: publicServiceAgent(service.agent) }, pipelineRegistration });
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ message: 'Invalid service details', issues: error.issues });
     next(error);
@@ -1325,8 +1330,7 @@ app.patch('/api/admin/services/:serviceId', requireAuth, requireSuperAdmin, asyn
     } catch (error) {
       pipelineRegistration = { registered: false, message: error.message };
     }
-    const { apiKeyEncrypted: _updatedAgentKey, ...updatedAgent } = service.agent || {};
-    res.json({ service: { ...service, agent: updatedAgent }, pipelineRegistration });
+    res.json({ service: { ...service, agent: publicServiceAgent(service.agent) }, pipelineRegistration });
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ message: 'Invalid service details', issues: error.issues });
     next(error);
