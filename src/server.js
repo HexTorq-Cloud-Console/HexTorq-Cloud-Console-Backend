@@ -245,6 +245,40 @@ function agentUrl(agent, route) {
   return `${agent.baseUrl.replace(/\/$/, '')}/${route.replace(/^\//, '')}`;
 }
 
+function deploymentKeyForService(service) {
+  const repositoryUrl = String(service.repositoryUrl || '').replace(/\.git$/, '').replace(/\/$/, '').toLowerCase();
+  if (repositoryUrl === 'https://github.com/hextorq-cloud-console/hextorq-cloud-console-backend') {
+    return 'HexTorq_Cloud_Console_Backend';
+  }
+  return service.templateKey || undefined;
+}
+
+async function registerServiceWithPipeline(service) {
+  if (!service?.agent?.apiKeyEncrypted) return { registered: false, message: 'Agent is not enrolled' };
+  const response = await fetch(agentUrl(service.agent, '/projects/register'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Console-Agent-Id': service.agent.id,
+      'X-Console-Agent-Key': decryptAgentKey(service.agent.apiKeyEncrypted),
+    },
+    body: JSON.stringify({
+      projectKey: service.projectKey,
+      type: service.type,
+      repositoryUrl: service.repositoryUrl,
+      branch: service.branch,
+      workingDirectory: service.workingDirectory,
+      deployDirectory: service.deployDirectory,
+      pm2ProcessName: service.pm2ProcessName,
+      deploymentKey: deploymentKeyForService(service),
+    }),
+    signal: AbortSignal.timeout(15 * 1000),
+  });
+  const body = await response.text();
+  if (!response.ok) throw new Error(`Pipeline project registration failed (${response.status}): ${body}`);
+  return JSON.parse(body || '{}');
+}
+
 async function getAccessibleService(req, serviceId) {
   const service = await prisma.service.findUnique({ where: { id: serviceId }, include: { agent: true, client: true } });
   if (!service || !service.enabled || !service.agent.enabled || (req.user.role === 'CLIENT' && service.clientId !== req.user.clientId)) return null;
@@ -1264,9 +1298,16 @@ app.post('/api/admin/services', requireAuth, requireSuperAdmin, async (req, res,
     if (input.type === 'STATIC_FRONTEND' && !input.deployDirectory) return res.status(400).json({ message: 'deployDirectory is required for static frontend services' });
     const [client, agent] = await Promise.all([prisma.client.findUnique({ where: { id: input.clientId } }), prisma.serverAgent.findUnique({ where: { id: input.agentId } })]);
     if (!client || !agent || !agent.enabled) return res.status(400).json({ message: 'Client or enabled agent not found' });
-    const service = await prisma.service.create({ data: input });
+    const service = await prisma.service.create({ data: input, include: { agent: true } });
     await writeAudit(req.user.email, 'SERVICE_CREATED', 'Service', service.id, { clientId: service.clientId, agentId: service.agentId });
-    res.status(201).json({ service });
+    let pipelineRegistration = null;
+    try {
+      pipelineRegistration = await registerServiceWithPipeline(service);
+    } catch (error) {
+      pipelineRegistration = { registered: false, message: error.message };
+    }
+    const { apiKeyEncrypted: _createdAgentKey, ...createdAgent } = service.agent || {};
+    res.status(201).json({ service: { ...service, agent: createdAgent }, pipelineRegistration });
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ message: 'Invalid service details', issues: error.issues });
     next(error);
@@ -1276,9 +1317,16 @@ app.post('/api/admin/services', requireAuth, requireSuperAdmin, async (req, res,
 app.patch('/api/admin/services/:serviceId', requireAuth, requireSuperAdmin, async (req, res, next) => {
   try {
     const input = z.object({ name: z.string().min(2).optional(), branch: z.string().min(1).optional(), webhookUrl: z.string().url().optional().nullable(), enabled: z.boolean().optional(), templateKey: z.string().optional(), customCommands: z.record(z.string(), z.string()).optional(), pm2ProcessName: z.string().optional(), deployDirectory: z.string().optional() }).parse(req.body);
-    const service = await prisma.service.update({ where: { id: req.params.serviceId }, data: input });
+    const service = await prisma.service.update({ where: { id: req.params.serviceId }, data: input, include: { agent: true } });
     await writeAudit(req.user.email, 'SERVICE_UPDATED', 'Service', service.id, input);
-    res.json({ service });
+    let pipelineRegistration = null;
+    try {
+      pipelineRegistration = await registerServiceWithPipeline(service);
+    } catch (error) {
+      pipelineRegistration = { registered: false, message: error.message };
+    }
+    const { apiKeyEncrypted: _updatedAgentKey, ...updatedAgent } = service.agent || {};
+    res.json({ service: { ...service, agent: updatedAgent }, pipelineRegistration });
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ message: 'Invalid service details', issues: error.issues });
     next(error);
