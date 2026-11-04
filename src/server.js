@@ -9,6 +9,7 @@ import { z } from 'zod';
 import { PrismaClient } from '@prisma/client';
 import { OAuth2Client } from 'google-auth-library';
 import { serviceTemplates } from './templates.js';
+import { matchServiceForEvent } from './serviceMatching.js';
 import {
   nextScheduledRun,
   nextScheduledRunAfter,
@@ -35,6 +36,11 @@ const webhookHealthTimeoutMs = configuredMilliseconds(
   60 * 1000,
 );
 const webhookHealthPollMs = configuredMilliseconds(process.env.WEBHOOK_HEALTH_POLL_MS, 3000, 500);
+const agentStaleThresholdMs = configuredMilliseconds(
+  process.env.AGENT_STALE_THRESHOLD_MS,
+  2 * 60 * 1000,
+  10 * 1000,
+);
 const schedulerEmail = process.env.WEBHOOK_SCHEDULER_EMAIL || 'scheduler@hextorq.local';
 const activeWebhookClients = new Set();
 const defaultFrontendOrigin = 'https://hex-torq-cloud-console-frontend.vercel.app';
@@ -224,10 +230,10 @@ app.get('/api/services', requireAuth, async (req, res, next) => {
     const where = req.user.role === 'CLIENT' ? { clientId: req.user.clientId } : {};
     const services = await prisma.service.findMany({
       where,
-      include: { client: true, agent: { select: { id: true, name: true, baseUrl: true, enabled: true } } },
+      include: { client: true, agent: { select: { id: true, name: true, baseUrl: true, enabled: true, lastSeenAt: true } } },
       orderBy: { createdAt: 'desc' },
     });
-    res.json({ services });
+    res.json({ services: services.map((service) => ({ ...service, agent: withAgentStatus(service.agent) })) });
   } catch (error) {
     next(error);
   }
@@ -235,9 +241,9 @@ app.get('/api/services', requireAuth, async (req, res, next) => {
 
 app.get('/api/services/:serviceId', requireAuth, async (req, res, next) => {
   try {
-    const service = await prisma.service.findUnique({ where: { id: req.params.serviceId }, include: { client: true, agent: { select: { id: true, name: true, baseUrl: true, enabled: true } } } });
+    const service = await prisma.service.findUnique({ where: { id: req.params.serviceId }, include: { client: true, agent: { select: { id: true, name: true, baseUrl: true, enabled: true, lastSeenAt: true } } } });
     if (!service || (req.user.role === 'CLIENT' && service.clientId !== req.user.clientId)) return res.status(404).json({ message: 'Service not found' });
-    res.json({ service });
+    res.json({ service: { ...service, agent: withAgentStatus(service.agent) } });
   } catch (error) { next(error); }
 });
 
@@ -283,6 +289,21 @@ function publicServiceAgent(agent) {
   if (!agent) return agent;
   const { apiKeyEncrypted, apiKeyHash, enrollmentToken, ...safeAgent } = agent;
   return safeAgent;
+}
+
+// Agent connectivity is derived from heartbeat timestamps, never from
+// `agent.enabled`. Disabled takes precedence, then a recent heartbeat marks
+// the agent online, a stale heartbeat offline, and no heartbeat yet unknown.
+function agentOnlineStatus(agent) {
+  if (!agent?.enabled) return 'disabled';
+  if (!agent.lastSeenAt) return 'unknown';
+  const elapsed = Date.now() - new Date(agent.lastSeenAt).getTime();
+  return elapsed <= agentStaleThresholdMs ? 'online' : 'offline';
+}
+
+function withAgentStatus(agent) {
+  if (!agent) return agent;
+  return { ...agent, status: agentOnlineStatus(agent) };
 }
 
 async function getAccessibleService(req, serviceId) {
@@ -360,14 +381,45 @@ function accessRecordValues(input, current = null) {
 }
 
 function serializeClientAccess(entry) {
+  // Metadata-only serialization. The encrypted secret is never included in
+  // ordinary list/update responses; it is only returned by the dedicated
+  // password-reveal endpoints after authorization.
   const { passwordEncrypted, ...access } = entry;
+  return { ...access, password: null };
+}
+
+const accessRevealWindowMs = 60 * 1000;
+const accessRevealLimit = 15;
+const accessRevealAttempts = new Map();
+
+function isAccessRevealRateLimited(userEmail) {
+  const now = Date.now();
+  const windowStart = now - accessRevealWindowMs;
+  const active = (accessRevealAttempts.get(userEmail) || []).filter((timestamp) => timestamp > windowStart);
+  if (active.length >= accessRevealLimit) return true;
+  active.push(now);
+  accessRevealAttempts.set(userEmail, active);
+  if (accessRevealAttempts.size > 5000) {
+    for (const [key, timestamps] of accessRevealAttempts) {
+      if (!timestamps.some((timestamp) => timestamp > windowStart)) accessRevealAttempts.delete(key);
+    }
+  }
+  return false;
+}
+
+function revealAccessPassword(access, actorEmail, route) {
+  if (isAccessRevealRateLimited(actorEmail)) {
+    return { limited: true };
+  }
   let password = null;
   try {
-    password = decryptSecret(passwordEncrypted);
+    password = access.passwordEncrypted ? decryptSecret(access.passwordEncrypted) : null;
   } catch (error) {
     console.error('Unable to decrypt client access credentials:', error.message);
+    return { error: 'Unable to decrypt credentials' };
   }
-  return { ...access, password };
+  void writeAudit(actorEmail, `${route}_ACCESS_PASSWORD_REVEALED`, 'ClientAccess', access.id, accessAuditMetadata(access));
+  return { password };
 }
 
 function accessAuditMetadata(access) {
@@ -392,6 +444,20 @@ app.get('/api/access', requireAuth, async (req, res, next) => {
   } catch (error) {
     next(error);
   }
+});
+
+app.get('/api/access/:accessId/reveal', requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== 'CLIENT') return res.status(403).json({ message: 'Client access required' });
+    const access = await prisma.clientAccess.findUnique({ where: { id: req.params.accessId } });
+    if (!access || access.clientId !== req.user.clientId || !access.enabled) {
+      return res.status(404).json({ message: 'Access entry not found' });
+    }
+    const result = revealAccessPassword(access, req.user.email, 'CLIENT');
+    if (result.limited) return res.status(429).json({ message: 'Too many reveal requests; try again shortly' });
+    if (result.error) return res.status(500).json({ message: result.error });
+    res.json({ accessId: access.id, password: result.password });
+  } catch (error) { next(error); }
 });
 
 function serviceDeploymentConfig(service) {
@@ -1109,6 +1175,17 @@ app.get('/api/admin/access', requireAuth, requireSuperAdmin, async (_req, res, n
   }
 });
 
+app.get('/api/admin/access/:accessId/reveal', requireAuth, requireSuperAdmin, async (req, res, next) => {
+  try {
+    const access = await prisma.clientAccess.findUnique({ where: { id: req.params.accessId } });
+    if (!access) return res.status(404).json({ message: 'Access entry not found' });
+    const result = revealAccessPassword(access, req.user.email, 'ADMIN');
+    if (result.limited) return res.status(429).json({ message: 'Too many reveal requests; try again shortly' });
+    if (result.error) return res.status(500).json({ message: result.error });
+    res.json({ accessId: access.id, password: result.password });
+  } catch (error) { next(error); }
+});
+
 app.post('/api/admin/access', requireAuth, requireSuperAdmin, async (req, res, next) => {
   try {
     const input = accessCreateSchema.parse(req.body);
@@ -1227,7 +1304,7 @@ app.post('/api/admin/clients', requireAuth, requireSuperAdmin, async (req, res, 
 app.get('/api/admin/agents', requireAuth, requireSuperAdmin, async (_req, res, next) => {
   try {
     const agents = await prisma.serverAgent.findMany({ select: { id: true, name: true, baseUrl: true, enabled: true, lastSeenAt: true, createdAt: true }, orderBy: { createdAt: 'desc' } });
-    res.json({ agents });
+    res.json({ agents: agents.map(withAgentStatus) });
   } catch (error) { next(error); }
 });
 
@@ -1345,11 +1422,23 @@ app.delete('/api/admin/services/:serviceId', requireAuth, requireSuperAdmin, asy
   } catch (error) { next(error); }
 });
 
+const deploymentInclude = {
+  service: { select: { id: true, name: true, projectKey: true } },
+  agent: { select: { id: true, name: true } },
+};
+
 app.get('/api/deployments', requireAuth, async (req, res, next) => {
   try {
     const where = req.user.role === 'CLIENT' ? { service: { clientId: req.user.clientId } } : {};
-    const deployments = await prisma.deployment.findMany({ where, include: { service: { select: { id: true, name: true, projectKey: true } }, agent: { select: { id: true, name: true } } }, orderBy: { startedAt: 'desc' }, take: 100 });
-    res.json({ deployments });
+    const orderBy = [{ startedAt: 'desc' }, { id: 'desc' }];
+    const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 100);
+    const cursor = typeof req.query.cursor === 'string' && req.query.cursor ? req.query.cursor : undefined;
+    const rows = cursor
+      ? await prisma.deployment.findMany({ where, include: deploymentInclude, orderBy, cursor: { id: cursor }, skip: 1, take: limit + 1 })
+      : await prisma.deployment.findMany({ where, include: deploymentInclude, orderBy, take: limit + 1 });
+    const hasMore = rows.length > limit;
+    const deployments = rows.slice(0, limit);
+    res.json({ deployments, hasMore, nextCursor: hasMore ? deployments[deployments.length - 1].id : null, limit });
   } catch (error) { next(error); }
 });
 
@@ -1359,6 +1448,86 @@ app.get('/api/deployments/:deploymentId/logs', requireAuth, async (req, res, nex
     if (!deployment || (req.user.role === 'CLIENT' && deployment.service.clientId !== req.user.clientId)) return res.status(404).json({ message: 'Deployment not found' });
     const logs = await prisma.deploymentLog.findMany({ where: { deploymentId: deployment.id }, orderBy: { timestamp: 'asc' } });
     res.json({ deployment, logs });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/admin/audit-logs', requireAuth, requireSuperAdmin, async (req, res, next) => {
+  try {
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
+    const page = Math.max(Number(req.query.page) || 1, 1);
+    const [total, logs] = await Promise.all([
+      prisma.auditLog.count(),
+      prisma.auditLog.findMany({ orderBy: { createdAt: 'desc' }, skip: (page - 1) * limit, take: limit }),
+    ]);
+    res.json({ logs, total, page, pageSize: limit, pageCount: Math.max(1, Math.ceil(total / limit)) });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/analytics', requireAuth, async (req, res, next) => {
+  try {
+    const days = Math.min(Math.max(Number(req.query.days) || 7, 1), 30);
+    const from = new Date();
+    from.setHours(0, 0, 0, 0);
+    from.setDate(from.getDate() - (days - 1));
+    const to = new Date();
+    const tenantWhere = req.user.role === 'CLIENT' ? { clientId: req.user.clientId } : {};
+    const deploymentWhere = req.user.role === 'CLIENT' ? { service: { clientId: req.user.clientId } } : {};
+
+    const [deployments, services] = await Promise.all([
+      prisma.deployment.findMany({
+        where: { ...deploymentWhere, startedAt: { gte: from, lte: to } },
+        select: { status: true, startedAt: true },
+      }),
+      prisma.service.findMany({ where: tenantWhere, select: { type: true, enabled: true } }),
+    ]);
+
+    const dateKeys = new Map();
+    for (let index = 0; index < days; index += 1) {
+      const date = new Date(from);
+      date.setDate(from.getDate() + index);
+      const key = date.toISOString().slice(0, 10);
+      dateKeys.set(key, { date: key, total: 0, successful: 0, failed: 0, running: 0 });
+    }
+
+    let successful = 0;
+    let failed = 0;
+    let running = 0;
+    for (const deployment of deployments) {
+      const bucket = dateKeys.get(new Date(deployment.startedAt).toISOString().slice(0, 10)) ||
+        { date: null, total: 0, successful: 0, failed: 0, running: 0 };
+      bucket.total += 1;
+      if (deployment.status === 'SUCCESS') {
+        successful += 1;
+        bucket.successful += 1;
+      } else if (deployment.status === 'FAILED' || deployment.status === 'ERROR') {
+        failed += 1;
+        bucket.failed += 1;
+      } else {
+        running += 1;
+        bucket.running += 1;
+      }
+    }
+
+    const resolvedBuckets = [...dateKeys.values()];
+    const completed = successful + failed;
+    res.json({
+      window: { from: from.toISOString(), to: to.toISOString(), days },
+      summary: {
+        total: deployments.length,
+        successful,
+        failed,
+        running,
+        successRate: completed ? Math.round((successful / completed) * 1000) / 10 : null,
+      },
+      daily: resolvedBuckets,
+      services: {
+        total: services.length,
+        enabled: services.filter((service) => service.enabled).length,
+        disabled: services.filter((service) => !service.enabled).length,
+        pm2: services.filter((service) => service.type === 'PM2').length,
+        static: services.filter((service) => service.type === 'STATIC_FRONTEND').length,
+      },
+    });
   } catch (error) { next(error); }
 });
 
@@ -1404,16 +1573,20 @@ app.post('/api/agents/:agentId/events', requireAgentKey, async (req, res, next) 
       deployerEmail: z.string().email().optional(),
       timestamp: z.string().datetime().optional(),
     }).parse(req.body);
-    const service = await prisma.service.findFirst({
-      where: {
-        agentId: agent.id,
-        OR: [
-          { projectKey: input.projectKey },
-          { templateKey: input.projectKey },
-        ],
-      },
-      orderBy: { projectKey: 'asc' },
+    // Deterministic service matching: an exact `projectKey` for this agent wins.
+    // Only when no exact match exists do we fall back to `templateKey`, and then
+    // only if the template key maps to exactly one service of this agent. An
+    // ambiguous template match is rejected instead of assigning a deployment to
+    // an arbitrary service.
+    const candidateServices = await prisma.service.findMany({
+      where: { agentId: agent.id },
+      select: { id: true, projectKey: true, templateKey: true },
     });
+    const matched = matchServiceForEvent(candidateServices, input.projectKey);
+    if (matched.conflict) {
+      return res.status(409).json({ message: 'Template key matches multiple services; deployment cannot be associated' });
+    }
+    const service = matched.match;
     if (!service) return res.status(404).json({ message: 'Service is not registered to this agent' });
     if (input.type === 'deployment-started') {
       await prisma.deployment.upsert({ where: { runId: input.runId }, create: { runId: input.runId, serviceId: service.id, agentId: agent.id, triggerSource: input.triggerSource || 'webhook', deployerEmail: input.deployerEmail, status: 'DEPLOYING', commitHash: input.commitHash, branch: input.branch, commitMessage: input.commitMessage }, update: { status: 'DEPLOYING', deployerEmail: input.deployerEmail, branch: input.branch, commitHash: input.commitHash, commitMessage: input.commitMessage } });
