@@ -87,7 +87,7 @@ model Service {
   slug                String
   type                ServiceType
   repositoryUrl       String
-  branch              String               @default("main")
+  branch              String?
   projectKey          String               @unique
   webhookUrl          String?
   workingDirectory    String

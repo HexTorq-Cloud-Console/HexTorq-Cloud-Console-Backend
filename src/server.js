@@ -1366,7 +1366,7 @@ app.post('/api/admin/services', requireAuth, requireSuperAdmin, async (req, res,
       slug: z.string().regex(/^[a-z0-9-]+$/),
       type: z.enum(['PM2', 'STATIC_FRONTEND']),
       repositoryUrl: z.string().url(),
-      branch: z.string().min(1).default('main'),
+       branch: z.string().min(1).optional(),
       projectKey: z.string().regex(/^[a-zA-Z0-9_.-]+$/),
       webhookUrl: z.string().url().optional(),
       workingDirectory: z.string().min(1),
@@ -1398,7 +1398,7 @@ app.post('/api/admin/services', requireAuth, requireSuperAdmin, async (req, res,
 
 app.patch('/api/admin/services/:serviceId', requireAuth, requireSuperAdmin, async (req, res, next) => {
   try {
-    const input = z.object({ name: z.string().min(2).optional(), branch: z.string().min(1).optional(), webhookUrl: z.string().url().optional().nullable(), enabled: z.boolean().optional(), templateKey: z.string().optional(), customCommands: z.record(z.string(), z.string()).optional(), pm2ProcessName: z.string().optional(), deployDirectory: z.string().optional() }).parse(req.body);
+     const input = z.object({ name: z.string().min(2).optional(), branch: z.string().min(1).nullable().optional(), webhookUrl: z.string().url().optional().nullable(), enabled: z.boolean().optional(), templateKey: z.string().optional(), customCommands: z.record(z.string(), z.string()).optional(), pm2ProcessName: z.string().optional(), deployDirectory: z.string().optional() }).parse(req.body);
     const service = await prisma.service.update({ where: { id: req.params.serviceId }, data: input, include: { agent: true } });
     await writeAudit(req.user.email, 'SERVICE_UPDATED', 'Service', service.id, input);
     let pipelineRegistration = null;
