@@ -487,6 +487,11 @@ function parseJsonBody(body) {
   }
 }
 
+function isGlobalPm2Output(message) {
+  const plain = String(message || '').replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, '').trimStart();
+  return /^[┌┬┐├┼┤└┴┘│]/.test(plain) || /^host metrics\s*\|/i.test(plain);
+}
+
 function upstreamMessage(parsed, body) {
   const message = typeof parsed?.message === 'string' ? parsed.message : body;
   return String(message || 'Pipeline request failed').slice(0, 10000);
@@ -1447,7 +1452,8 @@ app.get('/api/deployments/:deploymentId/logs', requireAuth, async (req, res, nex
     const deployment = await prisma.deployment.findUnique({ where: { id: req.params.deploymentId }, include: { service: true } });
     if (!deployment || (req.user.role === 'CLIENT' && deployment.service.clientId !== req.user.clientId)) return res.status(404).json({ message: 'Deployment not found' });
     const logs = await prisma.deploymentLog.findMany({ where: { deploymentId: deployment.id }, orderBy: { timestamp: 'asc' } });
-    res.json({ deployment, logs });
+    const visibleLogs = req.user.role === 'CLIENT' ? logs.filter((log) => !isGlobalPm2Output(log.message)) : logs;
+    res.json({ deployment, logs: visibleLogs });
   } catch (error) { next(error); }
 });
 
