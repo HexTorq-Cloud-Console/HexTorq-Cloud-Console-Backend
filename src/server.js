@@ -1587,6 +1587,15 @@ app.post('/api/notifications/subscribe', requireAuth, async (req, res, next) => 
   }
 });
 
+app.delete('/api/notifications/devices', requireAuth, async (req, res, next) => {
+  try {
+    const scope = currentScope(req);
+    if (!scope) return res.status(400).json({ message: 'Unable to resolve notification scope' });
+    const removed = await prisma.pushSubscription.deleteMany({ where: { scopeKey: scope.scopeKey } });
+    res.json({ removed: removed.count });
+  } catch (error) { next(error); }
+});
+
 app.delete('/api/notifications/subscribe', requireAuth, async (req, res, next) => {
   try {
     const scope = currentScope(req);
