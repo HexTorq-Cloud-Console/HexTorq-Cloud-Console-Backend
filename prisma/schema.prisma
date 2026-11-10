@@ -60,6 +60,8 @@ model Client {
   services                    Service[]
   accessEntries               ClientAccess[]
   webhookHealthRuns           WebhookHealthRun[]
+  pushSubscriptions           PushSubscription[]
+  notificationPreferences     NotificationPreference[]
 
   @@index([webhookScheduleEnabled, webhookScheduleNextRunAt])
 }
@@ -220,4 +222,46 @@ model SystemSetting {
   key       String   @unique
   value     String
   updatedAt DateTime @updatedAt
+}
+
+// A browser that has opted into deployment notifications.
+//
+// One row per device. The scope key is always non-null so it can carry a
+// unique constraint: clients are scoped by client id, super-admins by email.
+model PushSubscription {
+  id         String   @id @default(cuid())
+  scopeKey   String
+  clientId   String?
+  userEmail  String
+  endpoint   String   @unique
+  p256dh     String
+  auth       String
+  userAgent  String?
+  createdAt  DateTime @default(now())
+  lastUsedAt DateTime?
+  client     Client?  @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([scopeKey])
+  @@index([clientId])
+  @@index([userEmail])
+}
+
+// Per-user notification preferences. One row per scope.
+model NotificationPreference {
+  id              String   @id @default(cuid())
+  scopeKey        String   @unique
+  clientId        String?
+  userEmail       String
+  emailAddress    String?
+  pushEnabled     Boolean  @default(true)
+  emailEnabled    Boolean  @default(false)
+  notifyStarted   Boolean  @default(true)
+  notifyCompleted Boolean  @default(true)
+  notifyFailed    Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  client          Client?  @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
+  @@index([userEmail])
 }

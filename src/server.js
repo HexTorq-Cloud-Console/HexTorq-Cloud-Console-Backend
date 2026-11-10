@@ -11,6 +11,13 @@ import { OAuth2Client } from 'google-auth-library';
 import { serviceTemplates } from './templates.js';
 import { matchServiceForEvent } from './serviceMatching.js';
 import {
+  buildDeploymentNotification,
+  dispatchDeploymentNotification,
+  pushConfigured,
+  scopeKeyForUser,
+  smtpConfigured,
+} from './notifications.js';
+import {
   nextScheduledRun,
   nextScheduledRunAfter,
   resolveScheduleOptions,
@@ -1457,6 +1464,173 @@ app.get('/api/deployments/:deploymentId/logs', requireAuth, async (req, res, nex
   } catch (error) { next(error); }
 });
 
+/* -------------------- Deployment Notifications -------------------- */
+
+const pushSubscriptionSchema = z.object({
+  subscription: z.object({
+    endpoint: z.string().url(),
+    keys: z.object({
+      p256dh: z.string().min(1),
+      auth: z.string().min(1),
+    }),
+  }),
+});
+
+const notificationPreferenceSchema = z.object({
+  emailAddress: z.string().email().nullable().optional(),
+  pushEnabled: z.boolean().optional(),
+  emailEnabled: z.boolean().optional(),
+  notifyStarted: z.boolean().optional(),
+  notifyCompleted: z.boolean().optional(),
+  notifyFailed: z.boolean().optional(),
+});
+
+function currentScope(req) {
+  const scopeKey = scopeKeyForUser(req.user);
+  if (!scopeKey) return null;
+  return {
+    scopeKey,
+    clientId: req.user.role === 'CLIENT' ? req.user.clientId : null,
+    userEmail: req.user.email || '',
+  };
+}
+
+app.get('/api/notifications/config', requireAuth, async (req, res, next) => {
+  try {
+    const scope = currentScope(req);
+    const [preference, subscriptions] = scope
+      ? await Promise.all([
+        prisma.notificationPreference.findUnique({ where: { scopeKey: scope.scopeKey } }),
+        prisma.pushSubscription.findMany({ where: { scopeKey: scope.scopeKey }, select: { id: true, endpoint: true, createdAt: true, lastUsedAt: true } }),
+      ])
+      : [null, []];
+    res.json({
+      pushEnabled: pushConfigured(),
+      emailEnabled: smtpConfigured(),
+      vapidPublicKey: process.env.VAPID_PUBLIC_KEY || null,
+      scopeKey: scope?.scopeKey || null,
+      preferences: {
+        emailAddress: preference?.emailAddress || null,
+        pushEnabled: preference?.pushEnabled !== false,
+        emailEnabled: preference?.emailEnabled === true,
+        notifyStarted: preference?.notifyStarted !== false,
+        notifyCompleted: preference?.notifyCompleted !== false,
+        notifyFailed: preference?.notifyFailed !== false,
+      },
+      devices: subscriptions.map((item) => ({
+        id: item.id,
+        endpoint: item.endpoint.slice(0, 64),
+        createdAt: item.createdAt,
+        lastUsedAt: item.lastUsedAt,
+      })),
+      deviceCount: subscriptions.length,
+    });
+  } catch (error) { next(error); }
+});
+
+app.patch('/api/notifications/preferences', requireAuth, async (req, res, next) => {
+  try {
+    const scope = currentScope(req);
+    if (!scope) return res.status(400).json({ message: 'Unable to resolve notification scope' });
+    const input = notificationPreferenceSchema.parse(req.body);
+    const data = {
+      clientId: scope.clientId,
+      userEmail: scope.userEmail,
+      ...(input.emailAddress !== undefined ? { emailAddress: input.emailAddress } : {}),
+      ...(input.pushEnabled !== undefined ? { pushEnabled: input.pushEnabled } : {}),
+      ...(input.emailEnabled !== undefined ? { emailEnabled: input.emailEnabled } : {}),
+      ...(input.notifyStarted !== undefined ? { notifyStarted: input.notifyStarted } : {}),
+      ...(input.notifyCompleted !== undefined ? { notifyCompleted: input.notifyCompleted } : {}),
+      ...(input.notifyFailed !== undefined ? { notifyFailed: input.notifyFailed } : {}),
+    };
+    const preference = await prisma.notificationPreference.upsert({
+      where: { scopeKey: scope.scopeKey },
+      create: { scopeKey: scope.scopeKey, ...data },
+      update: data,
+    });
+    res.json({ preferences: preference });
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ message: 'Invalid notification preferences', issues: error.issues });
+    next(error);
+  }
+});
+
+app.post('/api/notifications/subscribe', requireAuth, async (req, res, next) => {
+  try {
+    const scope = currentScope(req);
+    if (!scope) return res.status(400).json({ message: 'Unable to resolve notification scope' });
+    const { subscription } = pushSubscriptionSchema.parse(req.body);
+    const record = await prisma.pushSubscription.upsert({
+      where: { endpoint: subscription.endpoint },
+      create: {
+        scopeKey: scope.scopeKey,
+        clientId: scope.clientId,
+        userEmail: scope.userEmail,
+        endpoint: subscription.endpoint,
+        p256dh: subscription.keys.p256dh,
+        auth: subscription.keys.auth,
+        userAgent: String(req.headers['user-agent'] || '').slice(0, 300),
+      },
+      update: {
+        scopeKey: scope.scopeKey,
+        clientId: scope.clientId,
+        userEmail: scope.userEmail,
+        p256dh: subscription.keys.p256dh,
+        auth: subscription.keys.auth,
+        userAgent: String(req.headers['user-agent'] || '').slice(0, 300),
+      },
+    });
+    res.status(201).json({ subscribed: true, id: record.id });
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ message: 'Invalid push subscription', issues: error.issues });
+    next(error);
+  }
+});
+
+app.delete('/api/notifications/subscribe', requireAuth, async (req, res, next) => {
+  try {
+    const scope = currentScope(req);
+    if (!scope) return res.status(400).json({ message: 'Unable to resolve notification scope' });
+    const { subscription } = pushSubscriptionSchema.parse(req.body);
+    await prisma.pushSubscription.deleteMany({ where: { endpoint: subscription.endpoint, scopeKey: scope.scopeKey } });
+    res.json({ subscribed: false });
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ message: 'Invalid push subscription', issues: error.issues });
+    next(error);
+  }
+});
+
+app.post('/api/notifications/test', requireAuth, async (req, res, next) => {
+  try {
+    const scope = currentScope(req);
+    if (!scope) return res.status(400).json({ message: 'Unable to resolve notification scope' });
+    const service = await prisma.service.findFirst({
+      where: scope.clientId ? { clientId: scope.clientId } : {},
+      orderBy: { createdAt: 'asc' },
+    });
+    const deployment = await prisma.deployment.findFirst({
+      where: service ? { serviceId: service.id } : {},
+      orderBy: { startedAt: 'desc' },
+    });
+    if (!service || !deployment) return res.status(404).json({ message: 'No deployment is available to build a test notification' });
+
+    const payload = buildDeploymentNotification({
+      event: 'completed',
+      status: 'SUCCESS',
+      service,
+      deployment,
+    });
+    const result = await dispatchDeploymentNotification({
+      prisma,
+      event: 'completed',
+      status: 'SUCCESS',
+      service,
+      deployment,
+    });
+    res.json({ ok: true, payload, result });
+  } catch (error) { next(error); }
+});
+
 app.get('/api/admin/audit-logs', requireAuth, requireSuperAdmin, async (req, res, next) => {
   try {
     const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
@@ -1560,6 +1734,35 @@ app.post('/api/agents/:agentId/heartbeat', requireAgentKey, async (req, res, nex
   } catch (error) { next(error); }
 });
 
+// Deployment notifications are dispatched in the background. A slow push
+// service or SMTP server must never delay the agent's event acknowledgement,
+// and a notification failure must never roll back the deployment record.
+function notifyDeployment(event, status, service, deployment) {
+  void (async () => {
+    try {
+      const logLines = await prisma.deploymentLog.findMany({
+        where: { deploymentId: deployment.id },
+        orderBy: { timestamp: 'asc' },
+        select: { message: true },
+      });
+      const result = await dispatchDeploymentNotification({
+        prisma,
+        event,
+        status,
+        service,
+        deployment,
+        logLines: logLines.map((line) => line.message),
+      });
+      console.log(
+        `[Notify] ${event} ${service.name} → push=${result.push?.sent ?? 0} email=${result.email?.sent ?? 0}`
+          + (result.skipped.length ? ` (skipped: ${result.skipped.join(', ')})` : ''),
+      );
+    } catch (error) {
+      console.error(`[Notify] ${event} for ${service.name} failed: ${error.message}`);
+    }
+  })();
+}
+
 app.post('/api/agents/:agentId/events', requireAgentKey, async (req, res, next) => {
   try {
     if (req.params.agentId !== req.agentCredentials.agentId) return res.status(403).json({ message: 'Agent identity mismatch' });
@@ -1586,7 +1789,7 @@ app.post('/api/agents/:agentId/events', requireAgentKey, async (req, res, next) 
     // an arbitrary service.
     const candidateServices = await prisma.service.findMany({
       where: { agentId: agent.id },
-      select: { id: true, projectKey: true, templateKey: true },
+      select: { id: true, projectKey: true, templateKey: true, clientId: true, name: true },
     });
     const matched = matchServiceForEvent(candidateServices, input.projectKey);
     if (matched.conflict) {
@@ -1595,14 +1798,17 @@ app.post('/api/agents/:agentId/events', requireAgentKey, async (req, res, next) 
     const service = matched.match;
     if (!service) return res.status(404).json({ message: 'Service is not registered to this agent' });
     if (input.type === 'deployment-started') {
-      await prisma.deployment.upsert({ where: { runId: input.runId }, create: { runId: input.runId, serviceId: service.id, agentId: agent.id, triggerSource: input.triggerSource || 'webhook', deployerEmail: input.deployerEmail, status: 'DEPLOYING', commitHash: input.commitHash, branch: input.branch, commitMessage: input.commitMessage }, update: { status: 'DEPLOYING', deployerEmail: input.deployerEmail, branch: input.branch, commitHash: input.commitHash, commitMessage: input.commitMessage } });
+      const deployment = await prisma.deployment.upsert({ where: { runId: input.runId }, create: { runId: input.runId, serviceId: service.id, agentId: agent.id, triggerSource: input.triggerSource || 'webhook', deployerEmail: input.deployerEmail, status: 'DEPLOYING', commitHash: input.commitHash, branch: input.branch, commitMessage: input.commitMessage }, update: { status: 'DEPLOYING', deployerEmail: input.deployerEmail, branch: input.branch, commitHash: input.commitHash, commitMessage: input.commitMessage } });
+      notifyDeployment('started', 'DEPLOYING', service, deployment);
     } else {
       const deployment = await prisma.deployment.findUnique({ where: { runId: input.runId } });
       if (!deployment) return res.status(404).json({ message: 'Deployment run not found' });
       if (input.type === 'deployment-log' && input.message) await prisma.deploymentLog.create({ data: { deploymentId: deployment.id, message: input.message, timestamp: input.timestamp ? new Date(input.timestamp) : undefined } });
       if (input.type === 'deployment-completed') {
         const completedAt = input.timestamp ? new Date(input.timestamp) : new Date();
-        await prisma.deployment.update({ where: { id: deployment.id }, data: { status: input.status || 'ERROR', completedAt, durationMs: completedAt.getTime() - deployment.startedAt.getTime(), failureReason: input.failureReason, commitHash: input.commitHash || undefined, commitMessage: input.commitMessage || undefined, branch: input.branch || undefined } });
+        const status = input.status || 'ERROR';
+        const updated = await prisma.deployment.update({ where: { id: deployment.id }, data: { status, completedAt, durationMs: completedAt.getTime() - deployment.startedAt.getTime(), failureReason: input.failureReason, commitHash: input.commitHash || undefined, commitMessage: input.commitMessage || undefined, branch: input.branch || undefined } });
+        notifyDeployment(status === 'SUCCESS' ? 'completed' : 'failed', status, service, updated);
       }
     }
     await prisma.serverAgent.update({ where: { id: agent.id }, data: { lastSeenAt: new Date() } });
