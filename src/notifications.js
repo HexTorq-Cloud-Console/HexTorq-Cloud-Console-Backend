@@ -251,7 +251,7 @@ export async function deliverPush(subscriptions, payload, { onExpired } = {}) {
 
   await Promise.all(subscriptions.map(async (subscription) => {
     try {
-      await webpush.sendNotification(
+      const result = await webpush.sendNotification(
         {
           endpoint: subscription.endpoint,
           keys: { p256dh: subscription.p256dh, auth: subscription.auth },
@@ -259,10 +259,12 @@ export async function deliverPush(subscriptions, payload, { onExpired } = {}) {
         body,
       );
       sent += 1;
+      console.log(`[Push] accepted for ${subscription.endpoint.slice(0, 48)}… (HTTP ${result?.statusCode ?? '?'})`);
     } catch (error) {
       const status = error?.statusCode;
       if (status === 404 || status === 410) {
         expired += 1;
+        console.log(`[Push] subscription expired (${status}); removing ${subscription.endpoint.slice(0, 48)}…`);
         if (onExpired) await onExpired(subscription);
         return;
       }
