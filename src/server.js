@@ -1640,6 +1640,50 @@ app.post('/api/notifications/test', requireAuth, async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+app.get('/api/admin/notifications', requireAuth, requireSuperAdmin, async (_req, res, next) => {
+  try {
+    const [clients, preferences, subscriptions] = await Promise.all([
+      prisma.client.findMany({
+        select: { id: true, name: true, email: true, enabled: true },
+        orderBy: { name: 'asc' },
+      }),
+      prisma.notificationPreference.findMany(),
+      prisma.pushSubscription.findMany({ select: { scopeKey: true, endpoint: true, lastUsedAt: true } }),
+    ]);
+
+    const devicesByScope = new Map();
+    for (const subscription of subscriptions) {
+      devicesByScope.set(subscription.scopeKey, (devicesByScope.get(subscription.scopeKey) || 0) + 1);
+    }
+    const preferenceByScope = new Map(preferences.map((preference) => [preference.scopeKey, preference]));
+
+    res.json({
+      clients: clients.map((client) => {
+        const scopeKey = `client:${client.id}`;
+        const preference = preferenceByScope.get(scopeKey);
+        return {
+          clientId: client.id,
+          name: client.name,
+          email: client.email,
+          enabled: client.enabled,
+          pushDevices: devicesByScope.get(scopeKey) || 0,
+          pushEnabled: preference ? preference.pushEnabled !== false : true,
+          emailEnabled: preference ? preference.emailEnabled === true : false,
+          emailAddress: preference?.emailAddress || null,
+          notifyStarted: preference ? preference.notifyStarted !== false : true,
+          notifyCompleted: preference ? preference.notifyCompleted !== false : true,
+          notifyFailed: preference ? preference.notifyFailed !== false : true,
+        };
+      }),
+      admin: {
+        pushDevices: preferences.length
+          ? subscriptions.filter((subscription) => subscription.scopeKey.startsWith('admin:')).length
+          : 0,
+      },
+    });
+  } catch (error) { next(error); }
+});
+
 app.get('/api/admin/audit-logs', requireAuth, requireSuperAdmin, async (req, res, next) => {
   try {
     const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
