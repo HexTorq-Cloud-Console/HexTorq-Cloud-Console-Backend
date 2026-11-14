@@ -427,6 +427,10 @@ async function registerServiceWithPipeline(service) {
       workingDirectory: service.workingDirectory,
       deployDirectory: service.deployDirectory,
       pm2ProcessName: service.pm2ProcessName,
+      // Per-service install/build commands travel with the registration so a
+      // server never has to hardcode one client's build steps.
+      installCommands: service.customCommands?.install ? [service.customCommands.install] : undefined,
+      buildCommands: service.customCommands?.build ? [service.customCommands.build] : undefined,
       deploymentKey: deploymentKeyForService(service),
     }),
     signal: AbortSignal.timeout(15 * 1000),
