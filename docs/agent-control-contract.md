@@ -7,6 +7,18 @@ X-Console-Agent-Id: <agent id>
 X-Console-Agent-Key: <enrolled agent key>
 ```
 
+## PM2 status (single and batch)
+
+```http
+GET /pm2/status/:processName
+GET /pm2/statuses
+```
+
+`/pm2/statuses` runs a single `pm2 jlist`, filters the result through the agent's
+allowlist, and returns `{ processes: [{ name, id, status, uptime, restarts, cpu, memory }] }`.
+Unknown processes are never returned, and arbitrary process names are never accepted.
+CPU/memory are consumed only by the console's Super-Admin-only endpoints.
+
 ## PM2 action
 
 ```http

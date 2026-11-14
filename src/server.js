@@ -11,17 +11,27 @@ import { OAuth2Client } from 'google-auth-library';
 import { serviceTemplates } from './templates.js';
 import { matchServiceForEvent } from './serviceMatching.js';
 import {
-  buildDeploymentNotification,
-  dispatchDeploymentNotification,
-  pushConfigured,
-  scopeKeyForUser,
-  smtpConfigured,
-} from './notifications.js';
-import {
   nextScheduledRun,
   nextScheduledRunAfter,
   resolveScheduleOptions,
 } from './schedule.js';
+import { redactSecrets, createLineRedactor } from './redact.js';
+import { resolveAgentStatus, heartbeatMeta, serializeAgent, serializeService, serializeServices } from './serializers.js';
+import { clientPm2Status, adminPm2Metrics, matchProcessesToServices, clientPm2Batch } from './pm2.js';
+import { validateDeploymentEventOwnership, completionDecision, validateLogMessage } from './eventOwnership.js';
+import { buildAnalytics, resolveTimeZone } from './analytics.js';
+import {
+  buildDeploymentNotification,
+  dispatchDeploymentNotification,
+  createEventNotifications,
+  createTestNotification,
+  listNotifications,
+  getUnreadCount,
+  markNotificationRead,
+  markAllNotificationsRead,
+  pushConfigured,
+  scopeKeyForUser,
+} from './notifications.js';
 
 const app = express();
 const prisma = new PrismaClient();
@@ -49,6 +59,7 @@ const agentStaleThresholdMs = configuredMilliseconds(
   10 * 1000,
 );
 const schedulerEmail = process.env.WEBHOOK_SCHEDULER_EMAIL || 'scheduler@hextorq.local';
+const reportingTimeZone = resolveTimeZone(process.env.REPORTING_TIMEZONE || process.env.WEBHOOK_SCHEDULE_TIMEZONE || 'UTC');
 const activeWebhookClients = new Set();
 const defaultFrontendOrigin = 'https://hex-torq-cloud-console-frontend.vercel.app';
 const allowedFrontendOrigins = new Set(
@@ -92,8 +103,28 @@ function createClientToken(client) {
   });
 }
 
-async function writeAudit(actorEmail, action, resourceType, resourceId, metadata = undefined) {
-  try { await prisma.auditLog.create({ data: { actorEmail, action, resourceType, resourceId, metadata } }); } catch (error) { console.error('Audit write failed:', error.message); }
+async function writeAudit(actorEmail, action, resourceType, resourceId, metadata = undefined, actor = {}) {
+  try {
+    await prisma.auditLog.create({
+      data: {
+        actorEmail,
+        actorRole: actor.actorRole ?? null,
+        clientId: actor.clientId ?? null,
+        action,
+        resourceType,
+        resourceId,
+        metadata,
+      },
+    });
+  } catch (error) { console.error('Audit write failed:', error.message); }
+}
+
+// Audit actor context derived from an authenticated request. Never includes secrets.
+function auditActor(req) {
+  return {
+    actorRole: req.user?.role ?? null,
+    clientId: req.user?.role === 'CLIENT' ? req.user.clientId : null,
+  };
 }
 
 function encryptionKey() {
@@ -237,20 +268,133 @@ app.get('/api/services', requireAuth, async (req, res, next) => {
     const where = req.user.role === 'CLIENT' ? { clientId: req.user.clientId } : {};
     const services = await prisma.service.findMany({
       where,
-      include: { client: true, agent: { select: { id: true, name: true, baseUrl: true, enabled: true, lastSeenAt: true } } },
+      include: {
+        client: { select: { id: true, name: true, email: true } },
+        agent: { select: { id: true, name: true, baseUrl: true, enabled: true, lastSeenAt: true, createdAt: true, updatedAt: true } },
+      },
       orderBy: { createdAt: 'desc' },
     });
-    res.json({ services: services.map((service) => ({ ...service, agent: withAgentStatus(service.agent) })) });
+    res.json({
+      services: serializeServices(services, { role: req.user.role, staleThresholdMs: agentStaleThresholdMs }),
+    });
   } catch (error) {
     next(error);
   }
 });
 
+// Tenant-safe batch PM2 status. Groups the caller's enabled PM2 services by
+// agent and calls each agent once. Returns operational status only — never
+// CPU/RAM — and never reveals processes the tenant does not own.
+app.get('/api/services/pm2/statuses', requireAuth, async (req, res, next) => {
+  try {
+    const where = req.user.role === 'CLIENT' ? { clientId: req.user.clientId } : {};
+    const services = await prisma.service.findMany({
+      where: { ...where, enabled: true, type: 'PM2' },
+      include: { agent: true },
+      orderBy: { createdAt: 'desc' },
+    });
+    const byAgent = new Map();
+    for (const service of services) {
+      if (!service.pm2ProcessName || !service.agent?.enabled || !service.agent?.apiKeyEncrypted) continue;
+      if (!byAgent.has(service.agentId)) byAgent.set(service.agentId, { agent: service.agent, services: [] });
+      byAgent.get(service.agentId).services.push(service);
+    }
+    const statuses = {};
+    await Promise.all([...byAgent.values()].map(async ({ agent, services: agentServices }) => {
+      const lifecycle = agentOnlineStatus(agent);
+      if (lifecycle !== 'online') {
+        for (const service of agentServices) {
+          statuses[service.id] = { serviceId: service.id, status: lifecycle === 'disabled' ? 'unavailable' : 'unknown', uptime: null, restarts: null, telemetryAvailable: false, telemetryStale: true };
+        }
+        return;
+      }
+      const result = await fetchAgentJson(agent, '/pm2/statuses');
+      if (!result.ok) {
+        for (const service of agentServices) {
+          statuses[service.id] = { serviceId: service.id, status: 'unavailable', uptime: null, restarts: null, telemetryAvailable: false, telemetryStale: true };
+        }
+        return;
+      }
+      const matched = matchProcessesToServices(result.body?.processes || [], agentServices);
+      Object.assign(statuses, clientPm2Batch(matched));
+      for (const service of agentServices) {
+        if (!statuses[service.id]) statuses[service.id] = { serviceId: service.id, status: 'unknown', uptime: null, restarts: null, telemetryAvailable: true, telemetryStale: false };
+      }
+    }));
+    res.json({ statuses, collectedAt: new Date().toISOString() });
+  } catch (error) { next(error); }
+});
+
+// Tenant-scoped service health aggregate. Distinguishes agent connectivity from
+// PM2 runtime health. No per-process metrics and no other tenant's data.
+app.get('/api/services/health', requireAuth, async (req, res, next) => {
+  try {
+    const where = req.user.role === 'CLIENT' ? { clientId: req.user.clientId } : {};
+    const services = await prisma.service.findMany({
+      where,
+      include: { agent: true },
+    });
+    const agents = new Map();
+    for (const service of services) {
+      if (service.agent) agents.set(service.agent.id, service.agent);
+    }
+    const agentSummary = { total: agents.size, online: 0, offline: 0, disabled: 0, unknown: 0 };
+    for (const agent of agents.values()) {
+      const status = agentOnlineStatus(agent);
+      agentSummary[status] = (agentSummary[status] || 0) + 1;
+    }
+
+    const pm2Services = services.filter((service) => service.type === 'PM2' && service.pm2ProcessName);
+    const monitorenabled = pm2Services.filter((service) => service.enabled);
+    const pm2Summary = { monitored: monitorenabled.length, online: 0, stopped: 0, errored: 0, unknown: 0, stale: 0 };
+    const byAgent = new Map();
+    for (const service of monitorenabled) {
+      if (!service.agent?.enabled || !service.agent?.apiKeyEncrypted) {
+        pm2Summary.unknown += 1;
+        continue;
+      }
+      if (!byAgent.has(service.agentId)) byAgent.set(service.agentId, { agent: service.agent, services: [] });
+      byAgent.get(service.agentId).services.push(service);
+    }
+    await Promise.all([...byAgent.values()].map(async ({ agent, services: agentServices }) => {
+      if (agentOnlineStatus(agent) !== 'online') {
+        pm2Summary.stale += agentServices.length;
+        return;
+      }
+      const result = await fetchAgentJson(agent, '/pm2/statuses');
+      if (!result.ok) {
+        pm2Summary.unknown += agentServices.length;
+        return;
+      }
+      const matched = matchProcessesToServices(result.body?.processes || [], agentServices);
+      const seen = new Set(matched.map((item) => item.serviceId));
+      for (const item of matched) {
+        pm2Summary[classifyPm2Status(item.status)] += 1;
+      }
+      pm2Summary.unknown += agentServices.length - seen.size;
+    }));
+
+    const staticServices = services.filter((service) => service.type === 'STATIC_FRONTEND');
+    res.json({
+      agents: agentSummary,
+      pm2: pm2Summary,
+      static: { total: staticServices.length, enabled: staticServices.filter((service) => service.enabled).length },
+      collectedAt: new Date().toISOString(),
+    });
+  } catch (error) { next(error); }
+});
+
 app.get('/api/services/:serviceId', requireAuth, async (req, res, next) => {
   try {
-    const service = await prisma.service.findUnique({ where: { id: req.params.serviceId }, include: { client: true, agent: { select: { id: true, name: true, baseUrl: true, enabled: true, lastSeenAt: true } } } });
+    const service = await prisma.service.findUnique({
+      where: { id: req.params.serviceId },
+      include: {
+        client: { select: { id: true, name: true, email: true } },
+        agent: { select: { id: true, name: true, baseUrl: true, enabled: true, lastSeenAt: true, createdAt: true, updatedAt: true } },
+      },
+    });
     if (!service || (req.user.role === 'CLIENT' && service.clientId !== req.user.clientId)) return res.status(404).json({ message: 'Service not found' });
-    res.json({ service: { ...service, agent: withAgentStatus(service.agent) } });
+    res.json({ service: serializeService(service, { role: req.user.role, staleThresholdMs: agentStaleThresholdMs }) });
   } catch (error) { next(error); }
 });
 
@@ -302,15 +446,38 @@ function publicServiceAgent(agent) {
 // `agent.enabled`. Disabled takes precedence, then a recent heartbeat marks
 // the agent online, a stale heartbeat offline, and no heartbeat yet unknown.
 function agentOnlineStatus(agent) {
-  if (!agent?.enabled) return 'disabled';
-  if (!agent.lastSeenAt) return 'unknown';
-  const elapsed = Date.now() - new Date(agent.lastSeenAt).getTime();
-  return elapsed <= agentStaleThresholdMs ? 'online' : 'offline';
+  return resolveAgentStatus(agent, agentStaleThresholdMs);
 }
 
+// Full operational agent view for Super Admin (secrets always stripped).
 function withAgentStatus(agent) {
-  if (!agent) return agent;
-  return { ...agent, status: agentOnlineStatus(agent) };
+  return serializeAgent(agent, { role: 'SUPER_ADMIN', staleThresholdMs: agentStaleThresholdMs });
+}
+
+// Fetch JSON from an enrolled agent with an enforced timeout. Returns a
+// normalized result so callers never throw on an offline agent.
+async function fetchAgentJson(agent, route, { timeoutMs = 15000 } = {}) {
+  if (!agent?.apiKeyEncrypted) return { ok: false, status: 409, error: 'Agent is not enrolled' };
+  try {
+    const response = await fetch(agentUrl(agent, route), {
+      headers: { 'X-Console-Agent-Id': agent.id, 'X-Console-Agent-Key': decryptAgentKey(agent.apiKeyEncrypted) },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await response.text();
+    let body = null;
+    try { body = JSON.parse(text); } catch { body = null; }
+    return { ok: response.ok, status: response.status, body, text };
+  } catch (error) {
+    return { ok: false, status: 502, error: error.message };
+  }
+}
+
+// PM2 process statuses map to operational buckets without leaking metrics.
+function classifyPm2Status(status) {
+  if (status === 'online') return 'online';
+  if (status === 'stopped' || status === 'stopping') return 'stopped';
+  if (status === 'errored') return 'errored';
+  return 'unknown';
 }
 
 async function getAccessibleService(req, serviceId) {
@@ -589,7 +756,7 @@ app.post('/api/services/:serviceId/deploy', requireAuth, async (req, res, next) 
       triggerSource: 'console',
       force: req.body?.force === true,
       runId: result.deploymentRunId,
-    });
+    }, { actorRole: req.user.role, clientId: service.clientId });
     res.status(202).json({
       serviceId: service.id,
       runId: result.deploymentRunId,
@@ -1153,11 +1320,22 @@ app.get('/api/services/:serviceId/pm2/logs/stream', requireAuth, async (req, res
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
     const reader = upstream.body.getReader();
-    req.on('close', () => reader.cancel().catch(() => {}));
+    const decoder = new TextDecoder();
+    const redactor = createLineRedactor();
+    let closed = false;
+    req.on('close', () => {
+      closed = true;
+      reader.cancel().catch(() => {});
+    });
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      res.write(Buffer.from(value));
+      const redacted = redactor.push(decoder.decode(value, { stream: true }));
+      if (redacted) res.write(redacted);
+    }
+    if (!closed) {
+      const tail = redactor.push(decoder.decode()) + redactor.flush();
+      if (tail) res.write(tail);
     }
     res.end();
   } catch (error) {
@@ -1165,13 +1343,92 @@ app.get('/api/services/:serviceId/pm2/logs/stream', requireAuth, async (req, res
   }
 });
 
+// Role-aware PM2 status.
+// - CLIENT: strictly operational DTO. No cpu/memory/raw resource fields, ever.
+// - SUPER_ADMIN: full operational + resource metrics for the console UI.
 app.get('/api/services/:serviceId/pm2/status', requireAuth, async (req, res, next) => {
   try {
     const service = await getAccessibleService(req, req.params.serviceId);
     if (!service || service.type !== 'PM2' || !service.pm2ProcessName || !service.agent.apiKeyEncrypted) return res.status(404).json({ message: 'PM2 service not found' });
-    const response = await fetch(agentUrl(service.agent, `/pm2/status/${encodeURIComponent(service.pm2ProcessName)}`), { headers: { 'X-Console-Agent-Id': service.agent.id, 'X-Console-Agent-Key': decryptAgentKey(service.agent.apiKeyEncrypted) } });
-    const body = await response.text();
-    res.status(response.ok ? 200 : 502).type('application/json').send(body);
+    const lifecycle = agentOnlineStatus(service.agent);
+    const telemetryStale = lifecycle !== 'online';
+    const result = await fetchAgentJson(service.agent, `/pm2/status/${encodeURIComponent(service.pm2ProcessName)}`);
+    const raw = result.ok ? result.body : null;
+    const lastUpdatedAt = new Date().toISOString();
+    if (req.user.role === 'SUPER_ADMIN') {
+      return res.json({
+        serviceId: service.id,
+        status: raw?.status ?? (result.ok ? 'unknown' : 'unavailable'),
+        uptime: typeof raw?.uptime === 'number' ? raw.uptime : null,
+        restarts: typeof raw?.restarts === 'number' ? raw.restarts : null,
+        cpu: typeof raw?.cpu === 'number' ? raw.cpu : null,
+        memory: typeof raw?.memory === 'number' ? raw.memory : null,
+        lastUpdatedAt,
+        telemetryAvailable: Boolean(result.ok && raw),
+        telemetryStale,
+      });
+    }
+    return res.json(clientPm2Status({
+      serviceId: service.id,
+      raw,
+      telemetryAvailable: Boolean(result.ok && raw),
+      telemetryStale,
+      lastUpdatedAt,
+    }));
+  } catch (error) { next(error); }
+});
+
+// Super Admin-only resource metrics for a single service. Unavailable metrics
+// are reported as null with a reason — never substituted with zero.
+app.get('/api/admin/services/:serviceId/pm2/metrics', requireAuth, requireSuperAdmin, async (req, res, next) => {
+  try {
+    const service = await prisma.service.findUnique({ where: { id: req.params.serviceId }, include: { agent: true } });
+    if (!service) return res.status(404).json({ message: 'Service not found' });
+    if (service.type !== 'PM2' || !service.pm2ProcessName) return res.status(400).json({ message: 'Service is not a PM2 process' });
+    const collectedAt = new Date().toISOString();
+    const base = { serviceId: service.id, agentId: service.agentId, processName: service.pm2ProcessName, collectedAt };
+    if (!service.agent?.apiKeyEncrypted) {
+      return res.json(adminPm2Metrics({ ...base, raw: null, available: false, reason: 'Agent is not enrolled' }));
+    }
+    if (!service.agent.enabled) {
+      return res.json(adminPm2Metrics({ ...base, raw: null, available: false, reason: 'Agent is disabled' }));
+    }
+    const lifecycle = agentOnlineStatus(service.agent);
+    if (lifecycle !== 'online') {
+      return res.json(adminPm2Metrics({ ...base, raw: null, available: false, reason: `Agent is ${lifecycle}` }));
+    }
+    const result = await fetchAgentJson(service.agent, `/pm2/status/${encodeURIComponent(service.pm2ProcessName)}`);
+    if (!result.ok || !result.body) {
+      return res.json(adminPm2Metrics({ ...base, raw: null, available: false, reason: result.error || 'PM2 metrics unavailable' }));
+    }
+    return res.json(adminPm2Metrics({ ...base, raw: result.body, available: true }));
+  } catch (error) { next(error); }
+});
+
+// Super Admin-only batch: one `pm2 jlist` per agent, matched to registered
+// services. Unregistered processes are excluded.
+app.get('/api/admin/agents/:agentId/pm2/statuses', requireAuth, requireSuperAdmin, async (req, res, next) => {
+  try {
+    const agent = await prisma.serverAgent.findUnique({
+      where: { id: req.params.agentId },
+      include: { services: { select: { id: true, name: true, type: true, enabled: true, pm2ProcessName: true } } },
+    });
+    if (!agent) return res.status(404).json({ message: 'Agent not found' });
+    const collectedAt = new Date().toISOString();
+    const agentStatus = agentOnlineStatus(agent);
+    const base = { agentId: agent.id, agentStatus, collectedAt, processes: [] };
+    if (!agent.enabled || !agent.apiKeyEncrypted) {
+      return res.json({ ...base, available: false, reason: 'Agent is disabled or not enrolled' });
+    }
+    if (agentStatus !== 'online') {
+      return res.json({ ...base, available: false, reason: `Agent is ${agentStatus}` });
+    }
+    const result = await fetchAgentJson(agent, '/pm2/statuses');
+    if (!result.ok) {
+      return res.json({ ...base, available: false, reason: result.error || 'Batch PM2 status unavailable' });
+    }
+    const processes = Array.isArray(result.body?.processes) ? result.body.processes : [];
+    return res.json({ ...base, available: true, processes: matchProcessesToServices(processes, agent.services) });
   } catch (error) { next(error); }
 });
 
@@ -1386,6 +1643,7 @@ app.post('/api/admin/services', requireAuth, requireSuperAdmin, async (req, res,
       pm2ProcessName: z.string().optional(),
       templateKey: z.string().optional(),
       customCommands: z.record(z.string(), z.string()).optional(),
+      clientControlEnabled: z.boolean().optional(),
       clientId: z.string().min(1),
       agentId: z.string().min(1),
     }).parse(req.body);
@@ -1394,14 +1652,14 @@ app.post('/api/admin/services', requireAuth, requireSuperAdmin, async (req, res,
     const [client, agent] = await Promise.all([prisma.client.findUnique({ where: { id: input.clientId } }), prisma.serverAgent.findUnique({ where: { id: input.agentId } })]);
     if (!client || !agent || !agent.enabled) return res.status(400).json({ message: 'Client or enabled agent not found' });
     const service = await prisma.service.create({ data: input, include: { agent: true } });
-    await writeAudit(req.user.email, 'SERVICE_CREATED', 'Service', service.id, { clientId: service.clientId, agentId: service.agentId });
+    await writeAudit(req.user.email, 'SERVICE_CREATED', 'Service', service.id, { clientId: service.clientId, agentId: service.agentId }, { actorRole: req.user.role });
     let pipelineRegistration = null;
     try {
       pipelineRegistration = await registerServiceWithPipeline(service);
     } catch (error) {
       pipelineRegistration = { registered: false, message: error.message };
     }
-    res.status(201).json({ service: { ...service, agent: publicServiceAgent(service.agent) }, pipelineRegistration });
+    res.status(201).json({ service: serializeService(service, { role: req.user.role, staleThresholdMs: agentStaleThresholdMs }), pipelineRegistration });
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ message: 'Invalid service details', issues: error.issues });
     next(error);
@@ -1410,16 +1668,19 @@ app.post('/api/admin/services', requireAuth, requireSuperAdmin, async (req, res,
 
 app.patch('/api/admin/services/:serviceId', requireAuth, requireSuperAdmin, async (req, res, next) => {
   try {
-     const input = z.object({ name: z.string().min(2).optional(), branch: z.string().min(1).nullable().optional(), webhookUrl: z.string().url().optional().nullable(), enabled: z.boolean().optional(), templateKey: z.string().optional(), customCommands: z.record(z.string(), z.string()).optional(), pm2ProcessName: z.string().optional(), deployDirectory: z.string().optional() }).parse(req.body);
+     const input = z.object({ name: z.string().min(2).optional(), branch: z.string().min(1).nullable().optional(), webhookUrl: z.string().url().optional().nullable(), enabled: z.boolean().optional(), templateKey: z.string().optional(), customCommands: z.record(z.string(), z.string()).optional(), pm2ProcessName: z.string().optional(), deployDirectory: z.string().optional(), clientControlEnabled: z.boolean().optional() }).parse(req.body);
     const service = await prisma.service.update({ where: { id: req.params.serviceId }, data: input, include: { agent: true } });
-    await writeAudit(req.user.email, 'SERVICE_UPDATED', 'Service', service.id, input);
+    await writeAudit(req.user.email, 'SERVICE_UPDATED', 'Service', service.id, input, { actorRole: req.user.role, clientId: service.clientId });
+    if (input.clientControlEnabled !== undefined) {
+      await writeAudit(req.user.email, 'SERVICE_CLIENT_CONTROL_UPDATED', 'Service', service.id, { clientControlEnabled: service.clientControlEnabled }, { actorRole: req.user.role, clientId: service.clientId });
+    }
     let pipelineRegistration = null;
     try {
       pipelineRegistration = await registerServiceWithPipeline(service);
     } catch (error) {
       pipelineRegistration = { registered: false, message: error.message };
     }
-    res.json({ service: { ...service, agent: publicServiceAgent(service.agent) }, pipelineRegistration });
+    res.json({ service: serializeService(service, { role: req.user.role, staleThresholdMs: agentStaleThresholdMs }), pipelineRegistration });
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ message: 'Invalid service details', issues: error.issues });
     next(error);
@@ -1429,7 +1690,7 @@ app.patch('/api/admin/services/:serviceId', requireAuth, requireSuperAdmin, asyn
 app.delete('/api/admin/services/:serviceId', requireAuth, requireSuperAdmin, async (req, res, next) => {
   try {
     const service = await prisma.service.delete({ where: { id: req.params.serviceId } });
-    await writeAudit(req.user.email, 'SERVICE_DELETED', 'Service', service.id, { name: service.name });
+    await writeAudit(req.user.email, 'SERVICE_DELETED', 'Service', service.id, { name: service.name }, { actorRole: req.user.role, clientId: service.clientId });
     res.json({ deleted: true, serviceId: service.id });
   } catch (error) { next(error); }
 });
@@ -1442,6 +1703,20 @@ const deploymentInclude = {
 app.get('/api/deployments', requireAuth, async (req, res, next) => {
   try {
     const where = req.user.role === 'CLIENT' ? { service: { clientId: req.user.clientId } } : {};
+    // Tenant-scoped filters. A CLIENT can narrow within its own tenant only.
+    if (typeof req.query.serviceId === 'string' && req.query.serviceId) where.serviceId = req.query.serviceId;
+    if (typeof req.query.status === 'string' && ['DEPLOYING', 'SUCCESS', 'FAILED', 'ERROR'].includes(req.query.status)) where.status = req.query.status;
+    if (typeof req.query.triggerSource === 'string' && req.query.triggerSource) where.triggerSource = req.query.triggerSource;
+    if (typeof req.query.branch === 'string' && req.query.branch) where.branch = req.query.branch;
+    if (typeof req.query.commitHash === 'string' && req.query.commitHash) where.commitHash = req.query.commitHash;
+    const from = typeof req.query.from === 'string' && req.query.from ? new Date(req.query.from) : null;
+    const to = typeof req.query.to === 'string' && req.query.to ? new Date(req.query.to) : null;
+    if ((from && !Number.isNaN(from.getTime())) || (to && !Number.isNaN(to.getTime()))) {
+      where.startedAt = {
+        ...(from && !Number.isNaN(from.getTime()) ? { gte: from } : {}),
+        ...(to && !Number.isNaN(to.getTime()) ? { lte: to } : {}),
+      };
+    }
     const orderBy = [{ startedAt: 'desc' }, { id: 'desc' }];
     const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 100);
     const cursor = typeof req.query.cursor === 'string' && req.query.cursor ? req.query.cursor : undefined;
@@ -1454,17 +1729,54 @@ app.get('/api/deployments', requireAuth, async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+// Currently-active deployments (queued/deploying). The data model has a single
+// active state (DEPLOYING); it is never derived from the history first page.
+app.get('/api/deployments/active', requireAuth, async (req, res, next) => {
+  try {
+    const where = { status: 'DEPLOYING' };
+    if (req.user.role === 'CLIENT') where.service = { clientId: req.user.clientId };
+    const deployments = await prisma.deployment.findMany({
+      where,
+      include: deploymentInclude,
+      orderBy: [{ startedAt: 'asc' }],
+      take: 200,
+    });
+    const now = Date.now();
+    res.json({
+      count: deployments.length,
+      deployments: deployments.map((deployment) => ({
+        id: deployment.id,
+        runId: deployment.runId,
+        status: deployment.status,
+        service: deployment.service,
+        agent: deployment.agent,
+        startedAt: deployment.startedAt,
+        elapsedMs: Math.max(0, now - new Date(deployment.startedAt).getTime()),
+      })),
+    });
+  } catch (error) { next(error); }
+});
+
 app.get('/api/deployments/:deploymentId/logs', requireAuth, async (req, res, next) => {
   try {
     const deployment = await prisma.deployment.findUnique({ where: { id: req.params.deploymentId }, include: { service: true } });
     if (!deployment || (req.user.role === 'CLIENT' && deployment.service.clientId !== req.user.clientId)) return res.status(404).json({ message: 'Deployment not found' });
-    const logs = await prisma.deploymentLog.findMany({ where: { deploymentId: deployment.id }, orderBy: { timestamp: 'asc' } });
+    const limit = Math.min(Math.max(Number(req.query.limit) || 2000, 1), 5000);
+    const logs = await prisma.deploymentLog.findMany({ where: { deploymentId: deployment.id }, orderBy: { timestamp: 'asc' }, take: limit });
     const visibleLogs = req.user.role === 'CLIENT' ? logs.filter((log) => !isGlobalPm2Output(log.message)) : logs;
-    res.json({ deployment, logs: visibleLogs });
+    // Secrets are redacted on the way out (deployment infrastructure can echo tokens).
+    res.json({
+      deployment: { ...deployment, service: serializeService(deployment.service, { role: req.user.role, staleThresholdMs: agentStaleThresholdMs }) },
+      logs: visibleLogs.map((log) => ({ ...log, message: redactSecrets(log.message) })),
+    });
   } catch (error) { next(error); }
 });
 
-/* -------------------- Deployment Notifications -------------------- */
+/* -------------------- In-app notifications -------------------- */
+// Persistent history (Notification table) is the authoritative record. Browser
+// push (PushSubscription) is one of three delivery surfaces for the same row:
+// the bell dropdown + toast and the Alerts history page read it too. There is
+// no email delivery.
 
 const pushSubscriptionSchema = z.object({
   subscription: z.object({
@@ -1477,14 +1789,16 @@ const pushSubscriptionSchema = z.object({
 });
 
 const notificationPreferenceSchema = z.object({
-  emailAddress: z.string().email().nullable().optional(),
   pushEnabled: z.boolean().optional(),
-  emailEnabled: z.boolean().optional(),
   notifyStarted: z.boolean().optional(),
   notifyCompleted: z.boolean().optional(),
   notifyFailed: z.boolean().optional(),
+  // Legacy (email removed). Accepted for backward compatibility; not delivered.
+  emailAddress: z.string().email().nullable().optional(),
+  emailEnabled: z.boolean().optional(),
 });
 
+// Ownership is derived from the verified JWT only — never from the request body.
 function currentScope(req) {
   const scopeKey = scopeKeyForUser(req.user);
   if (!scopeKey) return null;
@@ -1492,6 +1806,21 @@ function currentScope(req) {
     scopeKey,
     clientId: req.user.role === 'CLIENT' ? req.user.clientId : null,
     userEmail: req.user.email || '',
+  };
+}
+
+function serializeStoredNotification(item) {
+  return {
+    id: item.id,
+    type: item.type,
+    title: item.title,
+    body: item.body,
+    metadata: item.metadata || null,
+    resourceType: item.resourceType || null,
+    resourceId: item.resourceId || null,
+    read: item.readAt !== null,
+    readAt: item.readAt,
+    createdAt: item.createdAt,
   };
 }
 
@@ -1505,14 +1834,17 @@ app.get('/api/notifications/config', requireAuth, async (req, res, next) => {
       ])
       : [null, []];
     res.json({
+      // In-app notification capabilities.
+      enabled: true,
+      mode: 'in_app',
+      browserPushEnabled: pushConfigured(),
+      emailEnabled: false,
+      // Browser push + preference surface (kept for the existing frontend).
       pushEnabled: pushConfigured(),
-      emailEnabled: smtpConfigured(),
       vapidPublicKey: process.env.VAPID_PUBLIC_KEY || null,
       scopeKey: scope?.scopeKey || null,
       preferences: {
-        emailAddress: preference?.emailAddress || null,
         pushEnabled: preference?.pushEnabled !== false,
-        emailEnabled: preference?.emailEnabled === true,
         notifyStarted: preference?.notifyStarted !== false,
         notifyCompleted: preference?.notifyCompleted !== false,
         notifyFailed: preference?.notifyFailed !== false,
@@ -1528,6 +1860,55 @@ app.get('/api/notifications/config', requireAuth, async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+app.get('/api/notifications', requireAuth, async (req, res, next) => {
+  try {
+    const scope = currentScope(req);
+    if (!scope) return res.status(400).json({ message: 'Unable to resolve notification scope' });
+    const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 100);
+    const cursor = typeof req.query.cursor === 'string' && req.query.cursor ? req.query.cursor : null;
+    const filter = ['all', 'unread', 'read'].includes(String(req.query.filter)) ? String(req.query.filter) : 'all';
+    const page = await listNotifications({ prisma, scopeKey: scope.scopeKey, limit, cursor, filter });
+    res.json({
+      notifications: page.notifications.map(serializeStoredNotification),
+      total: page.total,
+      unreadCount: await getUnreadCount({ prisma, scopeKey: scope.scopeKey }),
+      hasMore: page.hasMore,
+      nextCursor: page.nextCursor,
+      limit,
+    });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/notifications/unread-count', requireAuth, async (req, res, next) => {
+  try {
+    const scope = currentScope(req);
+    if (!scope) return res.status(400).json({ message: 'Unable to resolve notification scope' });
+    res.json({ unreadCount: await getUnreadCount({ prisma, scopeKey: scope.scopeKey }) });
+  } catch (error) { next(error); }
+});
+
+app.patch('/api/notifications/:id/read', requireAuth, async (req, res, next) => {
+  try {
+    const scope = currentScope(req);
+    if (!scope) return res.status(400).json({ message: 'Unable to resolve notification scope' });
+    const existing = await prisma.notification.findUnique({ where: { id: req.params.id } });
+    // A notification outside the caller's scope is indistinguishable from one
+    // that does not exist.
+    if (!existing || existing.scopeKey !== scope.scopeKey) return res.status(404).json({ message: 'Notification not found' });
+    await markNotificationRead({ prisma, scopeKey: scope.scopeKey, id: existing.id });
+    res.json({ read: true, id: existing.id, unreadCount: await getUnreadCount({ prisma, scopeKey: scope.scopeKey }) });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/notifications/read-all', requireAuth, async (req, res, next) => {
+  try {
+    const scope = currentScope(req);
+    if (!scope) return res.status(400).json({ message: 'Unable to resolve notification scope' });
+    const result = await markAllNotificationsRead({ prisma, scopeKey: scope.scopeKey });
+    res.json({ updated: result.count, unreadCount: 0 });
+  } catch (error) { next(error); }
+});
+
 app.patch('/api/notifications/preferences', requireAuth, async (req, res, next) => {
   try {
     const scope = currentScope(req);
@@ -1536,19 +1917,28 @@ app.patch('/api/notifications/preferences', requireAuth, async (req, res, next) 
     const data = {
       clientId: scope.clientId,
       userEmail: scope.userEmail,
-      ...(input.emailAddress !== undefined ? { emailAddress: input.emailAddress } : {}),
       ...(input.pushEnabled !== undefined ? { pushEnabled: input.pushEnabled } : {}),
-      ...(input.emailEnabled !== undefined ? { emailEnabled: input.emailEnabled } : {}),
       ...(input.notifyStarted !== undefined ? { notifyStarted: input.notifyStarted } : {}),
       ...(input.notifyCompleted !== undefined ? { notifyCompleted: input.notifyCompleted } : {}),
       ...(input.notifyFailed !== undefined ? { notifyFailed: input.notifyFailed } : {}),
+      // Legacy email columns are stored but never delivered.
+      ...(input.emailAddress !== undefined ? { emailAddress: input.emailAddress } : {}),
+      ...(input.emailEnabled !== undefined ? { emailEnabled: input.emailEnabled } : {}),
     };
     const preference = await prisma.notificationPreference.upsert({
       where: { scopeKey: scope.scopeKey },
       create: { scopeKey: scope.scopeKey, ...data },
       update: data,
     });
-    res.json({ preferences: preference });
+    res.json({
+      preferences: {
+        pushEnabled: preference.pushEnabled !== false,
+        notifyStarted: preference.notifyStarted !== false,
+        notifyCompleted: preference.notifyCompleted !== false,
+        notifyFailed: preference.notifyFailed !== false,
+      },
+      message: 'Notification preferences saved.',
+    });
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ message: 'Invalid notification preferences', issues: error.issues });
     next(error);
@@ -1559,6 +1949,7 @@ app.post('/api/notifications/subscribe', requireAuth, async (req, res, next) => 
   try {
     const scope = currentScope(req);
     if (!scope) return res.status(400).json({ message: 'Unable to resolve notification scope' });
+    if (!pushConfigured()) return res.status(409).json({ message: 'Browser push is not configured on the server' });
     const { subscription } = pushSubscriptionSchema.parse(req.body);
     const record = await prisma.pushSubscription.upsert({
       where: { endpoint: subscription.endpoint },
@@ -1580,7 +1971,22 @@ app.post('/api/notifications/subscribe', requireAuth, async (req, res, next) => 
         userAgent: String(req.headers['user-agent'] || '').slice(0, 300),
       },
     });
-    res.status(201).json({ subscribed: true, id: record.id });
+    const deviceCount = await prisma.pushSubscription.count({ where: { scopeKey: scope.scopeKey } });
+    res.status(201).json({ subscribed: true, id: record.id, deviceCount, message: 'This device will now receive browser notifications.' });
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ message: 'Invalid push subscription', issues: error.issues });
+    next(error);
+  }
+});
+
+app.delete('/api/notifications/subscribe', requireAuth, async (req, res, next) => {
+  try {
+    const scope = currentScope(req);
+    if (!scope) return res.status(400).json({ message: 'Unable to resolve notification scope' });
+    const { subscription } = pushSubscriptionSchema.parse(req.body);
+    await prisma.pushSubscription.deleteMany({ where: { endpoint: subscription.endpoint, scopeKey: scope.scopeKey } });
+    const deviceCount = await prisma.pushSubscription.count({ where: { scopeKey: scope.scopeKey } });
+    res.json({ subscribed: false, deviceCount });
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ message: 'Invalid push subscription', issues: error.issues });
     next(error);
@@ -1592,72 +1998,47 @@ app.delete('/api/notifications/devices', requireAuth, async (req, res, next) => 
     const scope = currentScope(req);
     if (!scope) return res.status(400).json({ message: 'Unable to resolve notification scope' });
     const removed = await prisma.pushSubscription.deleteMany({ where: { scopeKey: scope.scopeKey } });
-    res.json({ removed: removed.count });
+    res.json({ removed: removed.count, deviceCount: 0 });
   } catch (error) { next(error); }
 });
 
-app.delete('/api/notifications/subscribe', requireAuth, async (req, res, next) => {
-  try {
-    const scope = currentScope(req);
-    if (!scope) return res.status(400).json({ message: 'Unable to resolve notification scope' });
-    const { subscription } = pushSubscriptionSchema.parse(req.body);
-    await prisma.pushSubscription.deleteMany({ where: { endpoint: subscription.endpoint, scopeKey: scope.scopeKey } });
-    res.json({ subscribed: false });
-  } catch (error) {
-    if (error instanceof z.ZodError) return res.status(400).json({ message: 'Invalid push subscription', issues: error.issues });
-    next(error);
-  }
-});
-
+// Creates a real notification for the authenticated account and pushes it to
+// that account's own devices. Does not depend on any historical deployment.
 app.post('/api/notifications/test', requireAuth, async (req, res, next) => {
   try {
     const scope = currentScope(req);
     if (!scope) return res.status(400).json({ message: 'Unable to resolve notification scope' });
-    const service = await prisma.service.findFirst({
-      where: scope.clientId ? { clientId: scope.clientId } : {},
-      orderBy: { createdAt: 'asc' },
-    });
-    const deployment = await prisma.deployment.findFirst({
-      where: service ? { serviceId: service.id } : {},
-      orderBy: { startedAt: 'desc' },
-    });
-    if (!service || !deployment) return res.status(404).json({ message: 'No deployment is available to build a test notification' });
-
-    const payload = buildDeploymentNotification({
-      event: 'completed',
-      status: 'SUCCESS',
-      service,
-      deployment,
-    });
-    const result = await dispatchDeploymentNotification({
+    const { stored, push } = await createTestNotification({
       prisma,
-      event: 'completed',
-      status: 'SUCCESS',
-      service,
-      deployment,
+      scopeKey: scope.scopeKey,
+      clientId: scope.clientId,
+      userEmail: scope.userEmail,
     });
-    res.json({ ok: true, payload, result });
+    res.json({
+      ok: true,
+      notification: stored.notification ? serializeStoredNotification(stored.notification) : null,
+      result: { push: { sent: push?.sent ?? 0, failed: push?.failed ?? 0 } },
+      message: push?.sent
+        ? `Test notification created and pushed to ${push.sent} device(s).`
+        : 'Test notification created. Enable browser push to also receive it on a device.',
+    });
   } catch (error) { next(error); }
 });
 
 app.get('/api/admin/notifications', requireAuth, requireSuperAdmin, async (_req, res, next) => {
   try {
     const [clients, preferences, subscriptions] = await Promise.all([
-      prisma.client.findMany({
-        select: { id: true, name: true, email: true, enabled: true },
-        orderBy: { name: 'asc' },
-      }),
+      prisma.client.findMany({ select: { id: true, name: true, email: true, enabled: true }, orderBy: { name: 'asc' } }),
       prisma.notificationPreference.findMany(),
-      prisma.pushSubscription.findMany({ select: { scopeKey: true, endpoint: true, lastUsedAt: true } }),
+      prisma.pushSubscription.findMany({ select: { scopeKey: true } }),
     ]);
-
     const devicesByScope = new Map();
     for (const subscription of subscriptions) {
       devicesByScope.set(subscription.scopeKey, (devicesByScope.get(subscription.scopeKey) || 0) + 1);
     }
     const preferenceByScope = new Map(preferences.map((preference) => [preference.scopeKey, preference]));
-
     res.json({
+      mode: 'in_app',
       clients: clients.map((client) => {
         const scopeKey = `client:${client.id}`;
         const preference = preferenceByScope.get(scopeKey);
@@ -1668,18 +2049,11 @@ app.get('/api/admin/notifications', requireAuth, requireSuperAdmin, async (_req,
           enabled: client.enabled,
           pushDevices: devicesByScope.get(scopeKey) || 0,
           pushEnabled: preference ? preference.pushEnabled !== false : true,
-          emailEnabled: preference ? preference.emailEnabled === true : false,
-          emailAddress: preference?.emailAddress || null,
           notifyStarted: preference ? preference.notifyStarted !== false : true,
           notifyCompleted: preference ? preference.notifyCompleted !== false : true,
           notifyFailed: preference ? preference.notifyFailed !== false : true,
         };
       }),
-      admin: {
-        pushDevices: preferences.length
-          ? subscriptions.filter((subscription) => subscription.scopeKey.startsWith('admin:')).length
-          : 0,
-      },
     });
   } catch (error) { next(error); }
 });
@@ -1692,75 +2066,33 @@ app.get('/api/admin/audit-logs', requireAuth, requireSuperAdmin, async (req, res
       prisma.auditLog.count(),
       prisma.auditLog.findMany({ orderBy: { createdAt: 'desc' }, skip: (page - 1) * limit, take: limit }),
     ]);
-    res.json({ logs, total, page, pageSize: limit, pageCount: Math.max(1, Math.ceil(total / limit)) });
+    // Backward-compatible aliases: the admin audit UI reads targetType/targetId,
+    // while existing consumers keep resourceType/resourceId.
+    res.json({
+      logs: logs.map((log) => ({ ...log, targetType: log.resourceType, targetId: log.resourceId })),
+      total,
+      page,
+      pageSize: limit,
+      pageCount: Math.max(1, Math.ceil(total / limit)),
+    });
   } catch (error) { next(error); }
 });
 
+// Database-backed, timezone-consistent analytics with a previous-window
+// comparison. Backward compatible: `window`, `summary`, `daily` and `services`
+// keep their existing shapes and meanings for the current frontend.
 app.get('/api/analytics', requireAuth, async (req, res, next) => {
   try {
-    const days = Math.min(Math.max(Number(req.query.days) || 7, 1), 30);
-    const from = new Date();
-    from.setHours(0, 0, 0, 0);
-    from.setDate(from.getDate() - (days - 1));
-    const to = new Date();
-    const tenantWhere = req.user.role === 'CLIENT' ? { clientId: req.user.clientId } : {};
-    const deploymentWhere = req.user.role === 'CLIENT' ? { service: { clientId: req.user.clientId } } : {};
-
-    const [deployments, services] = await Promise.all([
-      prisma.deployment.findMany({
-        where: { ...deploymentWhere, startedAt: { gte: from, lte: to } },
-        select: { status: true, startedAt: true },
-      }),
-      prisma.service.findMany({ where: tenantWhere, select: { type: true, enabled: true } }),
-    ]);
-
-    const dateKeys = new Map();
-    for (let index = 0; index < days; index += 1) {
-      const date = new Date(from);
-      date.setDate(from.getDate() + index);
-      const key = date.toISOString().slice(0, 10);
-      dateKeys.set(key, { date: key, total: 0, successful: 0, failed: 0, running: 0 });
-    }
-
-    let successful = 0;
-    let failed = 0;
-    let running = 0;
-    for (const deployment of deployments) {
-      const bucket = dateKeys.get(new Date(deployment.startedAt).toISOString().slice(0, 10)) ||
-        { date: null, total: 0, successful: 0, failed: 0, running: 0 };
-      bucket.total += 1;
-      if (deployment.status === 'SUCCESS') {
-        successful += 1;
-        bucket.successful += 1;
-      } else if (deployment.status === 'FAILED' || deployment.status === 'ERROR') {
-        failed += 1;
-        bucket.failed += 1;
-      } else {
-        running += 1;
-        bucket.running += 1;
-      }
-    }
-
-    const resolvedBuckets = [...dateKeys.values()];
-    const completed = successful + failed;
-    res.json({
-      window: { from: from.toISOString(), to: to.toISOString(), days },
-      summary: {
-        total: deployments.length,
-        successful,
-        failed,
-        running,
-        successRate: completed ? Math.round((successful / completed) * 1000) / 10 : null,
-      },
-      daily: resolvedBuckets,
-      services: {
-        total: services.length,
-        enabled: services.filter((service) => service.enabled).length,
-        disabled: services.filter((service) => !service.enabled).length,
-        pm2: services.filter((service) => service.type === 'PM2').length,
-        static: services.filter((service) => service.type === 'STATIC_FRONTEND').length,
-      },
+    const days = Math.min(Math.max(Number(req.query.days) || 7, 1), 90);
+    const clientId = req.user.role === 'CLIENT' ? req.user.clientId : null;
+    const payload = await buildAnalytics({
+      prisma,
+      clientId,
+      days,
+      timeZone: reportingTimeZone,
+      agentStatus: (agent) => resolveAgentStatus(agent, agentStaleThresholdMs),
     });
+    res.json(payload);
   } catch (error) { next(error); }
 });
 
@@ -1787,29 +2119,14 @@ app.post('/api/agents/:agentId/heartbeat', requireAgentKey, async (req, res, nex
   } catch (error) { next(error); }
 });
 
-// Deployment notifications are dispatched in the background. A slow push
-// service or SMTP server must never delay the agent's event acknowledgement,
-// and a notification failure must never roll back the deployment record.
+// Notifications are dispatched in the background: a slow push service must
+// never delay the agent's event acknowledgement, and a notification failure
+// must never roll back the deployment record.
 function notifyDeployment(event, status, service, deployment) {
   void (async () => {
     try {
-      const logLines = await prisma.deploymentLog.findMany({
-        where: { deploymentId: deployment.id },
-        orderBy: { timestamp: 'asc' },
-        select: { message: true },
-      });
-      const result = await dispatchDeploymentNotification({
-        prisma,
-        event,
-        status,
-        service,
-        deployment,
-        logLines: logLines.map((line) => line.message),
-      });
-      console.log(
-        `[Notify] ${event} ${service.name} → push=${result.push?.sent ?? 0} email=${result.email?.sent ?? 0}`
-          + (result.skipped.length ? ` (skipped: ${result.skipped.join(', ')})` : ''),
-      );
+      const result = await dispatchDeploymentNotification({ prisma, event, status, service, deployment });
+      console.log(`[Notify] ${event} ${service.name} → stored=${result.created ?? 0} push=${result.push?.sent ?? 0}`);
     } catch (error) {
       console.error(`[Notify] ${event} for ${service.name} failed: ${error.message}`);
     }
@@ -1852,16 +2169,31 @@ app.post('/api/agents/:agentId/events', requireAgentKey, async (req, res, next) 
     if (!service) return res.status(404).json({ message: 'Service is not registered to this agent' });
     if (input.type === 'deployment-started') {
       const deployment = await prisma.deployment.upsert({ where: { runId: input.runId }, create: { runId: input.runId, serviceId: service.id, agentId: agent.id, triggerSource: input.triggerSource || 'webhook', deployerEmail: input.deployerEmail, status: 'DEPLOYING', commitHash: input.commitHash, branch: input.branch, commitMessage: input.commitMessage }, update: { status: 'DEPLOYING', deployerEmail: input.deployerEmail, branch: input.branch, commitHash: input.commitHash, commitMessage: input.commitMessage } });
-      notifyDeployment('started', 'DEPLOYING', service, deployment);
+      void notifyDeployment('started', 'DEPLOYING', service, deployment);
     } else {
       const deployment = await prisma.deployment.findUnique({ where: { runId: input.runId } });
-      if (!deployment) return res.status(404).json({ message: 'Deployment run not found' });
-      if (input.type === 'deployment-log' && input.message) await prisma.deploymentLog.create({ data: { deploymentId: deployment.id, message: input.message, timestamp: input.timestamp ? new Date(input.timestamp) : undefined } });
+      // Ownership guard: the matched service's event may only touch this agent's
+      // own deployment for the same service.
+      const ownership = validateDeploymentEventOwnership({ deployment, service, agentId: agent.id });
+      if (!ownership.ok) return res.status(ownership.code).json({ message: ownership.message });
+      if (input.type === 'deployment-log') {
+        if (input.message) {
+          const messageCheck = validateLogMessage(input.message);
+          if (!messageCheck.ok) return res.status(413).json({ message: messageCheck.message });
+          await prisma.deploymentLog.create({ data: { deploymentId: deployment.id, message: redactSecrets(input.message), timestamp: input.timestamp ? new Date(input.timestamp) : undefined } });
+        }
+      }
       if (input.type === 'deployment-completed') {
+        // Idempotent: a repeated completion must not reopen a terminal deployment.
+        const decision = completionDecision(deployment.status);
+        if (!decision.apply) {
+          await prisma.serverAgent.update({ where: { id: agent.id }, data: { lastSeenAt: new Date() } });
+          return res.status(202).json({ accepted: true, duplicate: true });
+        }
         const completedAt = input.timestamp ? new Date(input.timestamp) : new Date();
         const status = input.status || 'ERROR';
-        const updated = await prisma.deployment.update({ where: { id: deployment.id }, data: { status, completedAt, durationMs: completedAt.getTime() - deployment.startedAt.getTime(), failureReason: input.failureReason, commitHash: input.commitHash || undefined, commitMessage: input.commitMessage || undefined, branch: input.branch || undefined } });
-        notifyDeployment(status === 'SUCCESS' ? 'completed' : 'failed', status, service, updated);
+        const updated = await prisma.deployment.update({ where: { id: deployment.id }, data: { status, completedAt, durationMs: completedAt.getTime() - deployment.startedAt.getTime(), failureReason: input.failureReason ? redactSecrets(input.failureReason) : input.failureReason, commitHash: input.commitHash || undefined, commitMessage: input.commitMessage || undefined, branch: input.branch || undefined } });
+        void notifyDeployment(status === 'SUCCESS' ? 'completed' : 'failed', status, service, updated);
       }
     }
     await prisma.serverAgent.update({ where: { id: agent.id }, data: { lastSeenAt: new Date() } });
@@ -1984,16 +2316,56 @@ async function reconcileInterruptedWebhookRuns() {
 
 const pm2Actions = new Set(['start', 'stop', 'restart', 'reload']);
 
+// Controlled PM2 process management.
+// Ownership/enabled are enforced by getAccessibleService (from the JWT + DB,
+// never a request-body flag). The process name is always the database value;
+// a client can never supply a process name or arbitrary command.
 app.post('/api/services/:serviceId/pm2/:action', requireAuth, async (req, res, next) => {
+  const action = req.params.action;
   try {
-    if (!pm2Actions.has(req.params.action)) return res.status(400).json({ message: 'Unsupported PM2 action' });
+    if (!pm2Actions.has(action)) return res.status(400).json({ message: 'Unsupported PM2 action' });
+    if (action === 'reload' && req.user.role !== 'SUPER_ADMIN') {
+      return res.status(403).json({ message: 'Reload is restricted to super admins' });
+    }
     const service = await getAccessibleService(req, req.params.serviceId);
-    if (!service || service.type !== 'PM2' || !service.pm2ProcessName || !service.agent.apiKeyEncrypted) return res.status(404).json({ message: 'PM2 service not found or agent is not enrolled' });
-    const response = await fetch(agentUrl(service.agent, `/control/pm2/${encodeURIComponent(service.pm2ProcessName)}/${req.params.action}`), { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Console-Agent-Key': decryptAgentKey(service.agent.apiKeyEncrypted), 'X-Console-Agent-Id': service.agent.id }, body: JSON.stringify({ requestedBy: req.user.email, serviceId: service.id }) });
+    if (!service || service.type !== 'PM2' || !service.pm2ProcessName || !service.agent.apiKeyEncrypted) {
+      return res.status(404).json({ message: 'PM2 service not found or agent is not enrolled' });
+    }
+    if (req.user.role === 'CLIENT' && !service.clientControlEnabled) {
+      return res.status(403).json({ message: 'Client process control is disabled for this service' });
+    }
+    const lifecycle = agentOnlineStatus(service.agent);
+    if (lifecycle !== 'online') {
+      return res.status(409).json({ message: `Agent is ${lifecycle}`, agentStatus: lifecycle });
+    }
+    const actor = auditActor(req);
+    const response = await fetch(agentUrl(service.agent, `/control/pm2/${encodeURIComponent(service.pm2ProcessName)}/${action}`), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Console-Agent-Key': decryptAgentKey(service.agent.apiKeyEncrypted), 'X-Console-Agent-Id': service.agent.id },
+      body: JSON.stringify({ requestedBy: req.user.email, serviceId: service.id }),
+      signal: AbortSignal.timeout(20 * 1000),
+    });
     const responseBody = await response.text();
-    if (!response.ok) return res.status(502).json({ message: 'Pipeline agent rejected PM2 action', upstreamStatus: response.status, upstreamBody: responseBody });
-    await writeAudit(req.user.email, `PM2_${req.params.action.toUpperCase()}`, 'Service', service.id, { processName: service.pm2ProcessName });
-    res.json({ action: req.params.action, serviceId: service.id, agentResponse: responseBody });
+    if (!response.ok) {
+      await writeAudit(req.user.email, `PM2_${action.toUpperCase()}_FAILED`, 'Service', service.id, {
+        processName: service.pm2ProcessName,
+        agentId: service.agentId,
+        result: 'failed',
+        upstreamStatus: response.status,
+        failureReason: redactSecrets(responseBody).slice(0, 500),
+      }, actor);
+      return res.status(502).json({
+        message: 'Pipeline agent rejected PM2 action',
+        upstreamStatus: response.status,
+        upstreamBody: redactSecrets(responseBody).slice(0, 2000),
+      });
+    }
+    await writeAudit(req.user.email, `PM2_${action.toUpperCase()}`, 'Service', service.id, {
+      processName: service.pm2ProcessName,
+      agentId: service.agentId,
+      result: 'accepted',
+    }, actor);
+    res.json({ action, serviceId: service.id, accepted: true, agentResponse: redactSecrets(responseBody).slice(0, 2000) });
   } catch (error) { next(error); }
 });
 
