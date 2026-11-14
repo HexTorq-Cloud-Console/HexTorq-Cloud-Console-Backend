@@ -178,6 +178,9 @@ model WebhookHealthRun {
   source             WebhookRunSource
   status             WebhookRunStatus     @default(RUNNING)
   requestedBy        String?
+  /// A forced run bypasses the pipeline's change detection and redeploys every
+  /// service even when no commits changed.
+  force              Boolean              @default(false)
   totalServices      Int                  @default(0)
   successfulServices Int                  @default(0)
   failedServices     Int                  @default(0)

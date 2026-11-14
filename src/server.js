@@ -843,6 +843,7 @@ async function serializeWebhookHealthRun(run) {
     source: run.source,
     status: run.status,
     requestedBy: run.requestedBy,
+    force: run.force === true,
     totalServices: run.totalServices,
     successfulServices: run.successfulServices,
     failedServices: run.failedServices,
@@ -884,6 +885,7 @@ async function loadWebhookHealth(clientId) {
         id: true,
         source: true,
         status: true,
+        force: true,
         totalServices: true,
         successfulServices: true,
         failedServices: true,
@@ -1034,7 +1036,7 @@ async function finalizeWebhookHealthRun(runId, actorEmail) {
   return run;
 }
 
-async function executeWebhookHealthRun({ runId, client, services, requestedBy }) {
+async function executeWebhookHealthRun({ runId, client, services, requestedBy, force = false }) {
   const servicesById = new Map(services.map((service) => [service.id, service]));
 
   try {
@@ -1073,6 +1075,7 @@ async function executeWebhookHealthRun({ runId, client, services, requestedBy })
           requestedBy,
           runId: `health-${crypto.randomUUID()}`,
           source: 'console',
+          force,
         });
       } catch (error) {
         result = {
@@ -1145,7 +1148,7 @@ async function executeWebhookHealthRun({ runId, client, services, requestedBy })
   }
 }
 
-async function startWebhookHealthRun({ client, source, requestedBy }) {
+async function startWebhookHealthRun({ client, source, requestedBy, force = false }) {
   if (activeWebhookClients.has(client.id)) {
     const activeRun = await prisma.webhookHealthRun.findFirst({
       where: { clientId: client.id, status: 'RUNNING' },
@@ -1180,6 +1183,7 @@ async function startWebhookHealthRun({ client, source, requestedBy }) {
         clientId: client.id,
         source,
         requestedBy,
+        force,
         totalServices: services.length,
         checks: { create: services.map((service) => ({ serviceId: service.id })) },
       },
@@ -1201,6 +1205,7 @@ async function startWebhookHealthRun({ client, source, requestedBy }) {
       client,
       services,
       requestedBy,
+      force,
     }).catch((error) => {
       console.error(`Unhandled webhook health run error for ${run.id}:`, error);
     });
@@ -1288,6 +1293,7 @@ app.post('/api/webhook-health/run', requireAuth, async (req, res, next) => {
       client,
       source: 'MANUAL',
       requestedBy: req.user.email,
+      force: req.body?.force === true,
     });
     if (result.conflict) {
       return res.status(409).json({
@@ -1300,6 +1306,7 @@ app.post('/api/webhook-health/run', requireAuth, async (req, res, next) => {
     await writeAudit(req.user.email, 'WEBHOOK_HEALTH_RUN_REQUESTED', 'WebhookHealthRun', result.run.id, {
       clientId: client.id,
       source: 'MANUAL',
+      force: req.body?.force === true,
     });
     res.status(202).json({ run: await serializeWebhookHealthRun(result.run) });
   } catch (error) { next(error); }
